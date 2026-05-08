@@ -5,22 +5,34 @@ build-backend = "hatchling.build"
 [project]
 name = "json-correction-loop"
 version = "0.1.0"
-description = "Domain-neutral critic-driven correction loop for large JSON state, with surgical RFC 6902 patching."
+description = "Critic-driven correction loop for large LLM-generated JSON state. Surgical RFC 6902 patching with sub-agents (path_finder + context narrowing). Works with OpenAI, Anthropic, OpenRouter."
 readme = "README.md"
 requires-python = ">=3.11"
 license = { text = "Apache-2.0" }
 authors = [
   { name = "Rick Choi", email = "rick@caveduck.io" },
 ]
-keywords = ["llm", "json", "rfc6902", "json-patch", "critic-loop", "self-refine", "agent"]
+keywords = [
+  "llm", "agent", "agents", "ai-agents", "llm-agent", "llm-tools",
+  "json", "json-patch", "rfc6902", "json-pointer", "rfc6901",
+  "critic-loop", "self-refine", "iterative-refinement",
+  "tool-calling", "structured-output", "structured-generation",
+  "openai", "anthropic", "openrouter",
+  "knowledge-graph", "kg-correction",
+  "pydantic",
+]
 classifiers = [
   "Development Status :: 3 - Alpha",
   "Intended Audience :: Developers",
+  "Intended Audience :: Science/Research",
   "License :: OSI Approved :: Apache Software License",
+  "Operating System :: OS Independent",
   "Programming Language :: Python :: 3",
   "Programming Language :: Python :: 3.11",
   "Programming Language :: Python :: 3.12",
   "Topic :: Scientific/Engineering :: Artificial Intelligence",
+  "Topic :: Software Development :: Libraries :: Python Modules",
+  "Typing :: Typed",
 ]
 dependencies = [
   "pydantic>=2.0",

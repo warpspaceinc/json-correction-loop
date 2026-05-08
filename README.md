@@ -1,11 +1,22 @@
 # json-correction-loop
 
-> A domain-neutral, critic-driven correction loop for **large JSON
-> state**, with surgical RFC 6902 patching and sub-agent decomposition.
+> A Python library for **iteratively correcting large LLM-generated JSON
+> and knowledge graphs** via **RFC 6902 patches** and a **multi-agent
+> sub-task** stack (`path_finder`, context narrowing, request validator,
+> patch evaluator). Composable critic loop with convergence policies.
+> Works with **OpenAI**, **Anthropic**, **OpenRouter**.
 
-[![PyPI](https://img.shields.io/badge/pypi-coming%20soon-yellow.svg)](#)
+[![PyPI](https://img.shields.io/pypi/v/json-correction-loop.svg)](https://pypi.org/project/json-correction-loop/)
+[![Python](https://img.shields.io/pypi/pyversions/json-correction-loop.svg)](https://pypi.org/project/json-correction-loop/)
 [![License](https://img.shields.io/badge/license-Apache--2.0-blue.svg)](LICENSE)
+[![CI](https://github.com/warpspaceinc/json-correction-loop/actions/workflows/ci.yml/badge.svg)](https://github.com/warpspaceinc/json-correction-loop/actions/workflows/ci.yml)
 [![Status](https://img.shields.io/badge/status-alpha-orange.svg)](#status)
+
+**TL;DR.** When an LLM regenerates a 100-entity / 183-edge JSON
+knowledge graph on critic feedback (the prevailing "full-regen"
+pattern), `gpt-4o-mini` fixes **0 / 8** flagged defects and burns 73K
+tokens. This library — a critic loop with surgical RFC 6902 patching
+and sub-agent decomposition — fixes **8 / 8** at 17K tokens.
 
 ## Why this exists
 
