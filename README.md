@@ -7,9 +7,11 @@
 > Works with **OpenAI**, **Anthropic**, **OpenRouter**.
 
 [![PyPI](https://img.shields.io/pypi/v/json-correction-loop.svg)](https://pypi.org/project/json-correction-loop/)
+[![Downloads](https://img.shields.io/pypi/dm/json-correction-loop.svg)](https://pypi.org/project/json-correction-loop/)
 [![Python](https://img.shields.io/pypi/pyversions/json-correction-loop.svg)](https://pypi.org/project/json-correction-loop/)
 [![License](https://img.shields.io/badge/license-Apache--2.0-blue.svg)](LICENSE)
 [![CI](https://github.com/warpspaceinc/json-correction-loop/actions/workflows/ci.yml/badge.svg)](https://github.com/warpspaceinc/json-correction-loop/actions/workflows/ci.yml)
+[![Discussions](https://img.shields.io/github/discussions/warpspaceinc/json-correction-loop)](https://github.com/warpspaceinc/json-correction-loop/discussions)
 [![Status](https://img.shields.io/badge/status-alpha-orange.svg)](#status)
 
 **TL;DR.** When an LLM regenerates a 100-entity / 183-edge JSON
@@ -17,6 +19,8 @@ knowledge graph on critic feedback (the prevailing "full-regen"
 pattern), `gpt-4o-mini` fixes **0 / 8** flagged defects and burns 73K
 tokens. This library — a critic loop with surgical RFC 6902 patching
 and sub-agent decomposition — fixes **8 / 8** at 17K tokens.
+
+![size sweep](docs/figures/fig2_size_sweep.png)
 
 ## Why this exists
 
@@ -45,16 +49,17 @@ flipped). Closing that gap requires sub-agents.
 
 ## What this library is
 
-A composable `gather → plan → execute` loop with four sub-agent
+A composable `gather → plan → execute` loop with five domain-pluggable
 slots:
 
 - **Critics** (you supply) report defects against stable item IDs
   (JSON pointers, entity IDs).
-- **path_finder** maps each critic-flagged symptom pointer to its
+- **`path_finder`** maps each critic-flagged symptom pointer to its
   root-cause pointer.
 - **Context narrowing** scopes both the sub-agent and the patcher to
   the slice of state implicated by flagged paths — turns out to be a
-  *correctness* component, not just a cost optimization.
+  *correctness* component, not just a cost optimization (we measured
+  this; see [Discussion #1][disc1]).
 - **Surgical patcher** emits RFC 6902 ops via tool calling, validated
   and applied with a standard JSON Patch library.
 - **Convergence policies** (quality-stable, hardcap) compose as
@@ -64,13 +69,16 @@ The library imports no specific LLM client, persistence layer, or
 event sink. Storage backends and event sinks are Protocols you plug
 in.
 
+[disc1]: https://github.com/warpspaceinc/json-correction-loop/discussions/1
+
 ## Install
 
 ```bash
-pip install json-correction-loop      # coming soon to PyPI
+pip install json-correction-loop
 ```
 
-Or from source:
+Requires Python 3.11+. Pydantic 2.x is the only runtime dependency.
+For development:
 
 ```bash
 git clone https://github.com/warpspaceinc/json-correction-loop
@@ -169,24 +177,47 @@ sub-agent stack) and size-sweep numbers are documented in
 
 ## Status
 
-- **Alpha (v0.1).** Public API may change before 1.0.
+- **Alpha (v0.1.0)** — published on
+  [PyPI](https://pypi.org/project/json-correction-loop/).
+  Public API may change before 1.0; release notes in
+  [CHANGELOG.md](CHANGELOG.md).
 - Domain-neutral library — bring your own critic, patcher prompt,
   and storage backend.
 
 ## Experiments
 
-These design choices are measured on a synthetic knowledge-graph
-perturbation benchmark. Headline result: at 100 entities,
-full-regeneration achieves 0% fix rate while the full library stack
-achieves 100% at ~5× fewer tokens.
+Design choices are measured on a synthetic knowledge-graph
+perturbation benchmark.
 
-See [EXPERIMENTS.md](EXPERIMENTS.md) for the setup, ablations, and
-size-sweep numbers.
+**Headline.** At 100 entities, full-regeneration achieves 0% fix rate;
+the full library stack achieves 100% at ~5× fewer tokens.
+
+**Ablation at size=100** (each component is load-bearing):
+
+| Cond | path_finder | narrowing | Fix% | Drift | Tokens |
+|---|:---:|:---:|---|---|---|
+| B0 (full-regen) | n/a | n/a | 0% | 8 | 73,740 |
+| O1 (loop+patch) | no | no | 35% | 23 | 42,621 |
+| O1N | no | yes | 57% | 13 | 14,392 |
+| O2 | yes | no | *JSON parse error* | — | — |
+| **O2N (full)** | **yes** | **yes** | **100%** | **6** | **17,117** |
+
+Full setup, condition definitions, per-seed variance, and reproduction
+recipe in [EXPERIMENTS.md](EXPERIMENTS.md). Long-form design rationale
+including failure-mode case studies in [Discussion #1][disc1].
+
+## Community
+
+- 🗣️ [Discussions](https://github.com/warpspaceinc/json-correction-loop/discussions)
+  — design questions, "does this work for my domain?" threads, show & tell.
+- 🐛 [Issues](https://github.com/warpspaceinc/json-correction-loop/issues)
+  — bug reports + feature requests.
+- 📦 [PyPI](https://pypi.org/project/json-correction-loop/)
 
 ## Contributing
 
-Issues and PRs welcome. Please run `pytest` and `ruff` before
-submitting.
+Issues and PRs welcome. Please run `pytest` and `ruff check src tests
+examples` before submitting. CI runs both on Python 3.11 and 3.12.
 
 ## License
 
