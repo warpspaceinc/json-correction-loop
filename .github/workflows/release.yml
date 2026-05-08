@@ -1,0 +1,44 @@
+name: Release to PyPI
+
+# Triggers on a version tag (e.g. ``v0.1.0``). Uses PyPI's trusted
+# publisher OIDC flow — no API token needed once the project is
+# configured at https://pypi.org/manage/account/publishing/. Set:
+#   - publisher: "GitHub"
+#   - owner: warpspaceinc
+#   - repository: json-correction-loop
+#   - workflow filename: release.yml
+#   - environment: pypi (matches the ``environment`` block below)
+on:
+  push:
+    tags:
+      - "v*"
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - run: pip install build
+      - run: python -m build
+      - uses: actions/upload-artifact@v4
+        with:
+          name: dist
+          path: dist/
+
+  publish:
+    needs: build
+    runs-on: ubuntu-latest
+    environment:
+      name: pypi
+      url: https://pypi.org/p/json-correction-loop
+    permissions:
+      id-token: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: dist
+          path: dist/
+      - uses: pypa/gh-action-pypi-publish@release/v1
