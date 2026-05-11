@@ -615,6 +615,56 @@ def _trim_schema_for_llm(schema: dict, max_depth: int = 3) -> dict:
 # ── Tool schemas ────────────────────────────────────────────────────────────
 
 
+# Default exposure state for LLM-visible tools.
+#   - Tools not listed here are exposed by default (writes, diff, undo, etc.)
+#   - Read-language tools (jq/python/javascript) defaults reflect the
+#     P58 benchmark outcome: jqBench predicts code > jq, and a 5-case
+#     4-mode test (in this repo) showed javascript-only fastest at
+#     97.8s avg vs 110s python-only vs 128s jq-only.
+#   - Legacy read trio (query/find_paths/find_values) stays off — A/B
+#     showed they fired in <3% of calls when jq was available.
+_DEFAULT_TOOL_STATE: dict[str, bool] = {
+    "query": False,
+    "find_paths": False,
+    "find_values": False,
+    "find_index": True,
+    "get_schema": True,
+    "jq": False,
+    "python": False,
+    "javascript": True,
+}
+
+
+def _tool_enabled(name: str) -> bool:
+    """Per-tool exposure check.
+
+    Priority (high → low):
+      1. ``JCL_TOOL_<UPPERCASE_NAME>`` env: ``1/0``, ``true/false``,
+         ``on/off``, ``yes/no``.
+      2. ``JCL_PATCHER_DISABLE_TOOLS`` env: comma-separated tool names
+         to force-disable (legacy bulk knob, kept for back-compat).
+      3. ``_DEFAULT_TOOL_STATE`` dict — falls back to ``True`` for tools
+         not explicitly listed.
+    """
+    per_tool = os.environ.get(f"JCL_TOOL_{name.upper()}")
+    if per_tool is not None:
+        return per_tool.strip().lower() in ("1", "true", "yes", "on")
+    bulk = os.environ.get("JCL_PATCHER_DISABLE_TOOLS")
+    if bulk is not None:
+        disabled = {n.strip() for n in bulk.split(",") if n.strip()}
+        if name in disabled:
+            return False
+    return _DEFAULT_TOOL_STATE.get(name, True)
+
+
+def _active_tool_schemas() -> list[dict]:
+    """Return the LLM-visible subset of ``_TOOL_SCHEMAS`` per
+    ``_tool_enabled``. Dispatch handlers stay registered regardless so
+    sub-agents (which carry their own schemas) and cascade ops still
+    work."""
+    return [t for t in _TOOL_SCHEMAS if _tool_enabled(t["function"]["name"])]
+
+
 _TOOL_SCHEMAS: list[dict] = [
     {
         "type": "function",
@@ -1098,6 +1148,86 @@ _TOOL_SCHEMAS: list[dict] = [
     {
         "type": "function",
         "function": {
+            "name": "python",
+            "description": (
+                "Execute a Python expression / snippet against the graph "
+                "(or a subtree). The graph is bound to ``data`` and "
+                "``json`` is available; the value of the last expression "
+                "(for one-liners) or a ``result`` variable (for "
+                "multi-statement code) is returned, JSON-serialized.\n"
+                "Per `jqBench` (Parnin et al. ICLR 2026), code-language "
+                "tools beat jq on harder JSON read/edit tasks because "
+                "the LLM can express conditionals, loops, and comprehensions "
+                "natively. Prefer python for: nested filters, paired/joined "
+                "lookups, indexed mutations, anything that takes >1 jq "
+                "pipeline. Use jq for simple projections / shape inspection.\n"
+                "Examples:\n"
+                "  • ``[(i, e['id']) for i, e in enumerate(data) if 'kev-legacy' in e.get('prerequisite_event_ids', [''])[0]]``\n"
+                "  • ``{e['id']: [m['entry_basis'] for m in e['character_motivations']] for e in data}``\n"
+                "  • Multi-statement: ``out=[]\\nfor i,e in enumerate(data):\\n    if e['act_number']==2: out.append(e['id'])\\nresult=out``\n"
+                "Read-only — modifications to ``data`` do NOT persist; "
+                "use ``patch`` / ``set_field`` / ``list_*`` ops to commit."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "code": {
+                        "type": "string",
+                        "description": "Python expression or multi-statement code (with ``result=...`` at the end).",
+                    },
+                    "pointer": {
+                        "type": "string",
+                        "description": (
+                            "Optional JSON Pointer to scope ``data`` "
+                            "(empty = whole graph)."
+                        ),
+                    },
+                },
+                "required": ["code"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "javascript",
+            "description": (
+                "Execute a JavaScript expression / snippet against the "
+                "graph (or a subtree) via embedded V8. The graph is "
+                "bound to the global ``data`` and the expression's value "
+                "(or a ``result`` variable for multi-statement code) is "
+                "returned, JSON-serialized.\n"
+                "Same use cases as ``python``, different syntax — pick "
+                "whichever expresses the transform most naturally. "
+                "Examples:\n"
+                "  • ``data.map(e => ({id: e.id, summary: e.summary.slice(0, 60)}))``\n"
+                "  • ``data.filter(e => e.act_number === 2).map(e => e.id)``\n"
+                "  • Multi-stmt: ``const out = {}; data.forEach(e => { out[e.id] = e.character_motivations.map(m => m.entry_basis); }); result = out;``\n"
+                "Read-only — modifications to ``data`` do NOT persist; "
+                "use ``patch`` / ``set_field`` / ``list_*`` ops to commit."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "code": {
+                        "type": "string",
+                        "description": "JavaScript expression or multi-statement code (with ``result = ...`` at the end).",
+                    },
+                    "pointer": {
+                        "type": "string",
+                        "description": (
+                            "Optional JSON Pointer to scope ``data`` "
+                            "(empty = whole graph)."
+                        ),
+                    },
+                },
+                "required": ["code"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
             "name": "diff",
             "description": (
                 "Show what you have changed in this requirement loop so far. "
@@ -1544,6 +1674,27 @@ def _find_values(graph: Any, keyword: str, max_results: int = 30) -> list[dict]:
 # ── Query auto-summary (P6) ─────────────────────────────────────────────────
 
 
+def _js_to_python(value: Any) -> Any:
+    """Recursively convert py-mini-racer's lazy JS proxy objects
+    (``JSArrayImpl``, ``JSMappedObjectImpl``, ...) into plain Python
+    lists / dicts so the result is JSON-serializable.
+
+    Primitives (str/int/float/bool/None) come back as native Python
+    already and pass through. Anything we don't recognise is returned
+    unchanged — the JSON dumper will surface the error if it can't
+    handle it.
+    """
+    try:
+        from py_mini_racer._objects import JSArrayImpl, JSMappedObjectImpl
+    except ImportError:
+        return value
+    if isinstance(value, JSArrayImpl):
+        return [_js_to_python(x) for x in value]
+    if isinstance(value, JSMappedObjectImpl):
+        return {k: _js_to_python(value[k]) for k in value.keys()}
+    return value
+
+
 def _summarize_for_query(value: Any, max_chars: int = 1500) -> str:
     """Render ``value`` for a ``query`` tool result with token-budget
     awareness. Three modes:
@@ -1826,7 +1977,7 @@ class SurgicalPatcher:
                     self.client,
                     model=self.model,
                     messages=messages,
-                    tools=_TOOL_SCHEMAS,
+                    tools=_active_tool_schemas(),
                     tool_choice="auto",
                     temperature=self.temperature,
                     max_tokens=self.max_tokens,
@@ -2407,6 +2558,12 @@ class SurgicalPatcher:
 
         if name == "jq":
             return self._jq(args)
+
+        if name == "python":
+            return self._python(args)
+
+        if name == "javascript":
+            return self._javascript(args)
 
         if name == "get_schema":
             ptr = args.get("pointer", "")
@@ -3028,6 +3185,227 @@ class SurgicalPatcher:
         # (typical for `.[]` style iteration).
         payload = results[0] if len(results) == 1 else results
         return {"content": _summarize_for_query(payload, max_chars=1500), "applied": []}
+
+    def _python(self, args: dict) -> dict:
+        """Execute Python code against the graph (or a scoped subtree).
+
+        Counterpart to ``_jq`` — read-only language tool with broader
+        expressiveness (loops, conditionals, comprehensions). Per
+        jqBench (Parnin et al. ICLR 2026), code-language tools beat
+        jq on harder JSON read tasks.
+
+        Two execution modes (auto-detected):
+          - single Python expression → ``eval``, value returned
+          - statements → ``exec``, ``result`` variable returned
+
+        Sandbox: a curated builtins subset (no I/O, no os, no eval/exec
+        within the snippet, no imports beyond ``json`` pre-bound).
+        ``data`` is a deep copy so accidental mutation can't leak into
+        ``self.graph`` — commits MUST go through ``patch`` / ``set_field``
+        / ``list_*`` tools.
+        """
+        code = args.get("code")
+        if not code or not isinstance(code, str):
+            return {
+                "content": json.dumps(
+                    {"error": "python requires non-empty 'code' (string)"},
+                    ensure_ascii=False,
+                ),
+                "applied": [],
+            }
+        ptr = (args.get("pointer") or "").rstrip("/")
+        try:
+            target = _resolve(self.graph, ptr) if ptr else self.graph
+        except (KeyError, IndexError, ValueError) as exc:
+            return {
+                "content": json.dumps(
+                    {"error": f"pointer {ptr!r} not found: {exc}"},
+                    ensure_ascii=False,
+                ),
+                "applied": [],
+            }
+        # Restricted builtins. Whitelisted utility functions only — no
+        # I/O, no introspection, no dynamic code (eval/exec/compile).
+        safe_builtins = {
+            n: getattr(__builtins__, n, None) if not isinstance(__builtins__, dict)
+            else __builtins__.get(n)
+            for n in (
+                "abs", "all", "any", "bool", "dict", "divmod", "enumerate",
+                "filter", "float", "frozenset", "getattr", "hasattr", "hash",
+                "int", "isinstance", "issubclass", "iter", "len", "list",
+                "map", "max", "min", "next", "ord", "pow", "print", "range",
+                "repr", "reversed", "round", "set", "slice", "sorted", "str",
+                "sum", "tuple", "type", "zip", "True", "False", "None",
+            )
+        }
+        # Filter out None entries (in case __builtins__ varies between
+        # interpreters). Also strip dunders defensively.
+        safe_builtins = {k: v for k, v in safe_builtins.items() if v is not None}
+        ns: dict[str, Any] = {
+            "__builtins__": safe_builtins,
+            "data": copy.deepcopy(target),
+            "json": json,
+        }
+        # Auto-detect single expression vs statements. ast.parse to
+        # decide: pure-expression → eval, statements → exec all-but-last
+        # with eval of trailing expression (Jupyter-cell semantics), or
+        # fall back to ``result`` variable when no trailing expression.
+        import ast as _ast
+        try:
+            tree = _ast.parse(code, mode="exec")
+        except SyntaxError as exc:
+            return {
+                "content": json.dumps(
+                    {
+                        "error": f"python syntax error: {exc.msg} (line {exc.lineno})",
+                        "code": code[:200],
+                    },
+                    ensure_ascii=False,
+                ),
+                "applied": [],
+            }
+        try:
+            if (
+                len(tree.body) == 1
+                and isinstance(tree.body[0], _ast.Expression.__bases__[0])
+                and isinstance(tree.body[0], _ast.Expr)
+            ):
+                # Single statement that IS an Expression (eval-able).
+                ret = eval(  # noqa: S307 — sandboxed
+                    compile(_ast.Expression(tree.body[0].value), "<python tool>", "eval"),
+                    ns,
+                )
+            elif tree.body and isinstance(tree.body[-1], _ast.Expr):
+                # Multi-statement with trailing expression — Jupyter-cell
+                # semantics: run preceding statements, eval last for return.
+                head = _ast.Module(body=tree.body[:-1], type_ignores=[])
+                tail = _ast.Expression(tree.body[-1].value)
+                exec(  # noqa: S102 — sandboxed
+                    compile(head, "<python tool>", "exec"), ns,
+                )
+                ret = eval(  # noqa: S307
+                    compile(tail, "<python tool>", "eval"), ns,
+                )
+            else:
+                # Pure statements — require ``result`` convention.
+                exec(compile(tree, "<python tool>", "exec"), ns)  # noqa: S102
+                if "result" not in ns:
+                    return {
+                        "content": json.dumps(
+                            {
+                                "error": "python: code with no trailing "
+                                         "expression must assign to "
+                                         "``result`` (e.g. ``result = [...]``)",
+                                "code": code[:200],
+                            },
+                            ensure_ascii=False,
+                        ),
+                        "applied": [],
+                    }
+                ret = ns["result"]
+        except Exception as exc:
+            return {
+                "content": json.dumps(
+                    {
+                        "error": f"python runtime error: {type(exc).__name__}: {exc}",
+                        "code": code[:200],
+                    },
+                    ensure_ascii=False,
+                ),
+                "applied": [],
+            }
+        # Serialize result. Fallback to repr for non-JSON-serializable
+        # values (set, tuple, custom objects).
+        try:
+            return {"content": _summarize_for_query(ret, max_chars=1500), "applied": []}
+        except Exception:
+            return {
+                "content": json.dumps(
+                    {"value_repr": repr(ret)[:1500], "note": "result not JSON-serializable"},
+                    ensure_ascii=False,
+                ),
+                "applied": [],
+            }
+
+    def _javascript(self, args: dict) -> dict:
+        """Execute JavaScript code against the graph (or scoped subtree)
+        via embedded V8 (py-mini-racer).
+
+        Counterpart to ``_python`` for jqBench-style comparison. The
+        graph is JSON-marshalled into V8 as the global ``data``;
+        the eval'd value (single expression) or a ``result`` variable
+        (multi-statement) is JSON-marshalled back.
+
+        Mutations to ``data`` inside V8 don't reach ``self.graph``
+        because the JSON round-trip is one-way.
+        """
+        code = args.get("code")
+        if not code or not isinstance(code, str):
+            return {
+                "content": json.dumps(
+                    {"error": "javascript requires non-empty 'code' (string)"},
+                    ensure_ascii=False,
+                ),
+                "applied": [],
+            }
+        ptr = (args.get("pointer") or "").rstrip("/")
+        try:
+            target = _resolve(self.graph, ptr) if ptr else self.graph
+        except (KeyError, IndexError, ValueError) as exc:
+            return {
+                "content": json.dumps(
+                    {"error": f"pointer {ptr!r} not found: {exc}"},
+                    ensure_ascii=False,
+                ),
+                "applied": [],
+            }
+        try:
+            from py_mini_racer import MiniRacer, JSEvalException, JSParseException
+        except ImportError:
+            return {
+                "content": json.dumps(
+                    {"error": "mini-racer not installed; javascript tool unavailable"},
+                    ensure_ascii=False,
+                ),
+                "applied": [],
+            }
+        # Fresh isolate per call — no persistent state. ~5-10ms cost,
+        # negligible vs LLM round-trip latency.
+        ctx = MiniRacer()
+        # Marshal graph subset as the global ``data``. JSON round-trip
+        # gives us a deep-copied snapshot (mutations stay in V8).
+        try:
+            ctx.eval(f"globalThis.data = {json.dumps(target, ensure_ascii=False)};")
+        except (JSEvalException, JSParseException) as exc:
+            return {
+                "content": json.dumps(
+                    {"error": f"javascript graph-marshal failed: {exc}"},
+                    ensure_ascii=False,
+                ),
+                "applied": [],
+            }
+        # V8 returns the value of the last completion-yielding statement
+        # in a script — naturally giving Jupyter-cell semantics. Single
+        # expression, multi-statement with trailing expression, and
+        # ``result = ...`` (assignment expression returns its rhs) all
+        # work without wrapping. No ``result`` convention needed.
+        try:
+            ret = ctx.eval(code)
+        except (JSParseException, JSEvalException) as exc:
+            return {
+                "content": json.dumps(
+                    {
+                        "error": f"javascript runtime error: {exc}",
+                        "code": code[:200],
+                    },
+                    ensure_ascii=False,
+                ),
+                "applied": [],
+            }
+        # mini-racer returns lazy proxies for objects/arrays; convert
+        # them to plain Python via recursive walk so json.dumps works.
+        ret = _js_to_python(ret)
+        return {"content": _summarize_for_query(ret, max_chars=1500), "applied": []}
 
     def _list_str_remove(self, args: dict, req: PatchRequest) -> dict:
         """Strip every occurrence of ``value`` from a list[str] at ``pointer``.

@@ -39,6 +39,10 @@ dependencies = [
   # jq tool for bulk graph queries — see SurgicalPatcher's `jq` tool.
   # PyPI `jq` ships libjq via wheels (no system jq dependency).
   "jq>=1.6",
+  # JavaScript execution tool — embedded V8, no Node.js dependency.
+  # Used by SurgicalPatcher's `javascript` tool (P58) for jqBench-style
+  # comparison vs jq / python.
+  "mini-racer>=0.12",
 ]
 
 [project.optional-dependencies]
