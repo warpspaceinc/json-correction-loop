@@ -197,6 +197,15 @@ End with exactly one ``verdict`` call.
       (evaluator will flag as partial).
   When you see these, return ``too_broad`` even if the literal
   surface text could be patched at target_pointer alone.
+  **EXCEPTION — verify cross-references actually exist before
+  rejecting.** If the intent names another section (e.g. "fix X
+  to align with Y's pattern") but ``find_paths`` confirms Y has
+  NO matching path in the data, the cross-section claim is moot:
+  there's nothing on the other side to leave dangling. In this
+  case, return ``valid`` (not ``too_broad``) when the suggested
+  local fix is plainly applicable to target_pointer. Models often
+  reference imaginary or out-of-scope sections in their rationale;
+  the patcher can still apply the local change.
 - ``ambiguous``: intent doesn't say clearly WHAT to change or HOW.
 - ``valid``: claim is true, suggestion is sensible. Default when none
   of the above apply.
@@ -332,7 +341,7 @@ def validate_request(
                 tool_choice="auto",
                 temperature=0.1,
                 max_tokens=2048,
-                extra={"reasoning_effort": os.environ.get("JCL_REASONING_EFFORT", "none").strip() or "none"},
+                extra=({"reasoning_effort": e} if (e := (os.environ.get("JCL_REASONING_EFFORT", "none").strip() or "none")) and e != "none" else {}),
             )
         except TransientLLMError as exc:
             logger.warning("request_validator transient error: %s", exc)

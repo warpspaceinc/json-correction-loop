@@ -21,7 +21,12 @@ import time
 from dataclasses import dataclass, field
 from typing import Any, Callable
 
-from json_correction_loop._config import DEFAULT_MAX_TOKENS, DEFAULT_MODEL
+from json_correction_loop._config import (
+    DEFAULT_MAX_TOKENS,
+    DEFAULT_MODEL,
+    DEFAULT_PATCHER_MAX_STEPS,
+    DEFAULT_PATCHER_READ_ONLY_BAIL,
+)
 from json_correction_loop._observability import log_verbose
 from json_correction_loop.llm import TransientLLMError
 
@@ -217,18 +222,62 @@ def _apply_op(graph: dict, op: dict) -> None:
     """
     op_name = op.get("op")
     path = op.get("path", "")
-    if op_name not in ("add", "replace", "remove", "merge"):
+    if op_name not in ("add", "replace", "remove", "merge", "rename_key"):
         # Common LLM confusion: emitting a top-level TOOL name (e.g.
         # ``list_insert_at``) as ``op`` inside ``patch.ops``. Reject with
         # a hint that points at the right shape — auto-translation now
         # happens earlier in ``_translate_tool_op_to_rfc``, so reaching
         # here means an unrecognised name.
         raise ValueError(
-            f"unsupported op: {op_name!r}; expected one of add/replace/remove/merge. "
+            f"unsupported op: {op_name!r}; expected one of add/replace/remove/merge/rename_key. "
             f"If you meant a narrow tool like list_insert_at/list_append/"
-            f"list_replace_at/set_field, call it directly as a separate tool — "
+            f"list_replace_at/set_field/rename_key, call it directly as a separate tool — "
             f"don't put its name inside patch.ops[].op."
         )
+
+    # rename_key is structurally distinct: it doesn't read/write a value,
+    # only swaps the dict key the value lives under. ``path`` resolves to
+    # the *container dict* (not the renamed entry). Insertion order is
+    # preserved by rebuilding the dict in place — important for keys like
+    # ``spaces`` where downstream rendering iterates in declaration order.
+    if op_name == "rename_key":
+        old_key = op.get("old_key")
+        new_key = op.get("new_key")
+        if old_key is None or new_key is None:
+            raise ValueError(
+                "rename_key requires 'old_key' and 'new_key' alongside 'path' "
+                "(JSON Pointer to the containing dict)"
+            )
+        if not isinstance(old_key, str) or not isinstance(new_key, str):
+            raise ValueError(
+                f"rename_key 'old_key' and 'new_key' must be strings, got "
+                f"{type(old_key).__name__}/{type(new_key).__name__}"
+            )
+        if old_key == new_key:
+            return  # no-op, treat as success
+        container = _resolve(graph, path) if path else graph
+        if not isinstance(container, dict):
+            raise ValueError(
+                f"rename_key target {path!r} is not a dict ({type(container).__name__}); "
+                f"only dict keys can be renamed"
+            )
+        if old_key not in container:
+            raise KeyError(f"rename_key: {old_key!r} not in dict at {path!r}")
+        if new_key in container:
+            raise ValueError(
+                f"rename_key: {new_key!r} already exists in dict at {path!r}; "
+                f"refusing to overwrite the existing entry"
+            )
+        # Rebuild in place to preserve insertion order — Python dicts are
+        # ordered since 3.7 and downstream renderers (e.g. world spaces
+        # tree walk) rely on declaration order.
+        new_items = [
+            (new_key if k == old_key else k, v) for k, v in container.items()
+        ]
+        container.clear()
+        container.update(new_items)
+        return
+
     parts = _split_pointer(path)
     if not parts:
         raise ValueError("whole-document patches not allowed")
@@ -331,6 +380,7 @@ _NARROW_TOOL_NAMES = frozenset({
 # instead of "unsupported op: X" which the LLM may keep hammering.
 _NON_TRANSLATABLE_TOOL_NAMES = frozenset({
     "list_replace_where", "list_remove_where", "list_set_where",
+    "list_str_remove", "list_move_at",
     "patch", "query", "get_schema", "diff", "undo",
 })
 
@@ -737,6 +787,31 @@ _TOOL_SCHEMAS: list[dict] = [
     {
         "type": "function",
         "function": {
+            "name": "list_move_at",
+            "description": (
+                "Move the element at `from_index` to `to_index` in the list "
+                "at `pointer`. Use when the list's order matters (scene "
+                "playback order, sequence tension curve) and the critic asks "
+                "to reorder rather than replace content. ``to_index`` is the "
+                "FINAL position the moved item will occupy in the result "
+                "list; e.g. moving index 0 to index 3 in [a,b,c,d,e] yields "
+                "[b,c,d,a,e]. Equal indices are a no-op."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "intent": {"type": "string"},
+                    "pointer": {"type": "string", "description": "JSON Pointer to the list."},
+                    "from_index": {"type": "integer", "description": "Current 0-based index of the item to move."},
+                    "to_index": {"type": "integer", "description": "Final 0-based index where the moved item lands in the result list."},
+                },
+                "required": ["intent", "pointer", "from_index", "to_index"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
             "name": "list_replace_where",
             "description": (
                 "Replace a list item identified by an identity field (label / id / "
@@ -847,6 +922,37 @@ _TOOL_SCHEMAS: list[dict] = [
     {
         "type": "function",
         "function": {
+            "name": "list_str_remove",
+            "description": (
+                "Remove all occurrences of a specific string `value` from a "
+                "list of strings at `pointer`. Use this when an item id was "
+                "removed elsewhere and now appears as a stale reference inside "
+                "another item's id-list (e.g. `prerequisite_event_ids`, "
+                "`assigned_event_ids`). Without this tool the alternative is "
+                "set_field with the whole list re-emitted, which is brittle "
+                "(LLM may drop unrelated entries). No-op when value isn't "
+                "present (returns ok=true with removed=0)."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "intent": {"type": "string"},
+                    "pointer": {
+                        "type": "string",
+                        "description": "JSON Pointer to the list[str].",
+                    },
+                    "value": {
+                        "type": "string",
+                        "description": "Exact string to remove from the list.",
+                    },
+                },
+                "required": ["intent", "pointer", "value"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
             "name": "find_paths",
             "description": (
                 "Search the graph's KEY space for `keyword` (substring, "
@@ -909,6 +1015,89 @@ _TOOL_SCHEMAS: list[dict] = [
     {
         "type": "function",
         "function": {
+            "name": "find_index",
+            "description": (
+                "Look up the integer index of a list-of-dicts item by an "
+                "identity field, in one step. Use this immediately before "
+                "an index-keyed op (`list_insert_at`, `list_replace_at`, "
+                "`list_remove_at`) when you already know the item id but "
+                "not the position. Returns ``{\"index\": N}`` for a single "
+                "match; ``{\"indices\": [N, M, ...]}`` for multi; "
+                "``{\"error\": ..., \"available_values\": [...]}`` when no "
+                "item matches (so you can spot a typo). Identity-keyed "
+                "edits (where the index doesn't matter) should use "
+                "`list_replace_where` / `list_set_where` / "
+                "`list_remove_where` directly — those resolve the index "
+                "internally."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "pointer": {
+                        "type": "string",
+                        "description": "JSON Pointer to the list of dicts.",
+                    },
+                    "key_field": {
+                        "type": "string",
+                        "description": "Identity field on each item (e.g. 'id', 'label', 'name').",
+                    },
+                    "key_value": {
+                        "description": "Value of `key_field` to look up — exact equality match.",
+                    },
+                },
+                "required": ["pointer", "key_field", "key_value"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "jq",
+            "description": (
+                "Run a `jq` expression against the graph (or a subtree) "
+                "to extract / project / filter in one step. Replaces "
+                "long chains of `query` + `find_values` + per-item `query` "
+                "when you need bulk info from many items. Returns the jq "
+                "output (multiple values are wrapped in a JSON array). "
+                "Common patterns:\n"
+                "  • `.key_events | map({id, summary: .summary[:60]})` — "
+                "id+brief summary of every item\n"
+                "  • `.key_events | map(select(.act_number == 2))` — "
+                "filter by field\n"
+                "  • `.key_events | to_entries | map({i: .key, id: .value.id})` — "
+                "index→id map\n"
+                "  • `[paths(strings) as $p | select(getpath($p) | "
+                "tostring | startswith(\"kev-legacy\")) | $p]` — every "
+                "path to a stale id (returns list of pointer-segment lists)\n"
+                "  • `.key_events[] | select(.id == \"kev-XYZ\")` — find by id\n"
+                "Use `pointer` to scope the input (default: whole graph). "
+                "Read-only — does not modify state. Errors (syntax / "
+                "runtime) come back with the offending expression so you "
+                "can correct on the next call."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "expression": {
+                        "type": "string",
+                        "description": "jq expression to evaluate.",
+                    },
+                    "pointer": {
+                        "type": "string",
+                        "description": (
+                            "Optional JSON Pointer to scope the input "
+                            "(empty = whole graph). The expression sees "
+                            "the value at this pointer as ``.``"
+                        ),
+                    },
+                },
+                "required": ["expression"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
             "name": "diff",
             "description": (
                 "Show what you have changed in this requirement loop so far. "
@@ -965,7 +1154,10 @@ def _chat_with_retry(client, *, max_attempts: int = 3, **kwargs):
     """
     effort = os.environ.get("JCL_REASONING_EFFORT", "none").strip() or "none"
     kwargs.setdefault("extra", {})
-    kwargs["extra"].setdefault("reasoning_effort", effort)
+    # Some backends (FriendliAI serverless) reject ``"none"`` enum
+    # with HTTP 422. Omit the key entirely when effort is none.
+    if effort and effort != "none":
+        kwargs["extra"].setdefault("reasoning_effort", effort)
     last: Exception | None = None
     for attempt in range(max_attempts):
         try:
@@ -1436,7 +1628,10 @@ class SurgicalPatcher:
         *,
         client: Any = None,
         model: str | None = None,
-        max_steps: int = 10,
+        # Default sourced from JCL_PATCHER_MAX_STEPS env (P56) —
+        # historically 10 (P7C) → 15 (P51) → 30 (P54). See _config.py
+        # for the corresponding read-only bail tuning.
+        max_steps: int = DEFAULT_PATCHER_MAX_STEPS,
         max_tokens: int = DEFAULT_MAX_TOKENS,
         temperature: float = 0.2,
         root_schema: dict | None = None,
@@ -1599,6 +1794,8 @@ class SurgicalPatcher:
         llm_calls = 0
         addressed = False
         reason: str | None = None
+        # P49: one-shot retry latch when the model returns zero tool calls.
+        no_tool_call_retried = False
 
         try:
             for step in range(self.max_steps):
@@ -1658,8 +1855,33 @@ class SurgicalPatcher:
                             f"finish_reason=length with no tool_calls — "
                             f"max_tokens={self.max_tokens} likely too low for emission"
                         )
-                    else:
-                        reason = "model returned no tool calls"
+                        break
+                    # P49: model returned no tool calls. Some models
+                    # (DeepSeek-V3.2 in particular on certain prompts)
+                    # occasionally emit a free-text response instead of
+                    # invoking a tool — typically saying "the change
+                    # would not improve the document" or describing what
+                    # they'd do without doing it. Inject a directive
+                    # nudge ONCE and retry; if the model declines again,
+                    # then break. Without this, an entire batch (~32
+                    # traces in bunsikjip-noir world) fell off with 0
+                    # steps and 0 ops, and the requirement was wrongly
+                    # marked unaddressed.
+                    if not no_tool_call_retried:
+                        no_tool_call_retried = True
+                        messages.append({
+                            "role": "user",
+                            "content": (
+                                "You did not call any tool. Either:\n"
+                                "(a) Apply the change with set_field / merge / "
+                                "list_*_where, or\n"
+                                "(b) If you believe no change is needed, call "
+                                "patch with intent='no change needed' and "
+                                "ops=[] to converge."
+                            ),
+                        })
+                        continue
+                    reason = "model returned no tool calls"
                     break
 
                 empty_patch_seen = False
@@ -1706,6 +1928,57 @@ class SurgicalPatcher:
                         args=args,
                         result_summary=summary,
                     ))
+                    # P27: identical-call-with-identical-error detector.
+                    # When the LLM submits the same (tool, normalized
+                    # args) twice in a row AND both attempts fail with
+                    # the same error, inject a sharp user message so the
+                    # next step doesn't repeat blindly. Without this,
+                    # weak models (small/local) stay stuck in a 3-step
+                    # loop on schema-mismatched ops until P7B bails
+                    # with no progress.
+                    sig = (name, json.dumps(args, ensure_ascii=False, sort_keys=True))
+                    looks_like_failure = (
+                        '"error"' in summary
+                        or '"rejected"' in summary
+                        and '"applied": 0' in summary
+                    )
+                    last_failed_sigs = self._loop_state.setdefault(
+                        "last_failed_sigs", []
+                    )
+                    if looks_like_failure:
+                        last_failed_sigs.append(sig)
+                        # Keep at most the last 4 entries.
+                        if len(last_failed_sigs) > 4:
+                            del last_failed_sigs[:-4]
+                        # Two identical failed sigs in a row → inject
+                        # corrective guidance once per repetition.
+                        if (
+                            len(last_failed_sigs) >= 2
+                            and last_failed_sigs[-1] == last_failed_sigs[-2]
+                            and not self._loop_state.get(
+                                "p27_warned_for", ""
+                            ) == repr(sig)
+                        ):
+                            self._loop_state["p27_warned_for"] = repr(sig)
+                            messages.append({
+                                "role": "user",
+                                "content": (
+                                    f"You just called `{name}` with the "
+                                    f"SAME arguments and got the SAME error "
+                                    f"twice. Stop repeating. Read the error "
+                                    f"text — it usually names the expected "
+                                    f"type or the available keys. Either "
+                                    f"(a) call `get_schema(pointer=...)` to "
+                                    f"discover the correct value type, "
+                                    f"(b) call `query(pointer=...)` to see "
+                                    f"the available list keys, "
+                                    f"(c) emit a different op with corrected "
+                                    f"args, or (d) call `patch(ops=[])` to "
+                                    f"give up on this requirement."
+                                ),
+                            })
+                    else:
+                        last_failed_sigs.clear()
                     # Verbose mode: stream each tool invocation inline so
                     # the operator can watch the patcher in real time
                     # instead of waiting for the per-iteration summary.
@@ -1759,6 +2032,21 @@ class SurgicalPatcher:
                     # a fresh op before converge.
                     unresolved = self._unresolved_negative_eval_paths()
                     if unresolved:
+                        # P26: cumulative re-eval against initial snapshot.
+                        # Per-op partial verdicts can mislead when the LLM
+                        # built up the fix across several ops — each op
+                        # in isolation looks partial but cumulatively the
+                        # intent is addressed. Ask the evaluator once on
+                        # the full diff. If "addressed", let convergence
+                        # proceed; otherwise keep the original gate.
+                        cumulative_ok = self._cumulative_eval_addressed(req)
+                        if cumulative_ok:
+                            addressed = True
+                            reason = (
+                                "auto-converged: cumulative re-eval addressed "
+                                f"({len(self._loop_state['applied_ops'])} ops)"
+                            )
+                            break
                         messages.append({
                             "role": "user",
                             "content": (
@@ -1816,6 +2104,37 @@ class SurgicalPatcher:
                     self._loop_state["consecutive_no_applied_steps"] += 1
                 elif new_applied_in_step > 0:
                     self._loop_state["consecutive_no_applied_steps"] = 0
+                # P38: track consecutive read-only steps separately. Some
+                # models (DeepSeek-V3.2 observed) get stuck in pure
+                # exploration mode — querying repeatedly without ever
+                # emitting a patch op. The original consecutive_no_applied
+                # counter excludes read-only steps, so the loop runs to
+                # max_steps with zero applied ops. Bail after
+                # ``DEFAULT_PATCHER_READ_ONLY_BAIL`` consecutive query-only
+                # steps with no patches applied. Threshold history:
+                # 5 → 10 (P51) → 20 (P56) — bulk-DAG-revise intents
+                # routinely need 10+ read-only passes before the LLM has
+                # enough info to commit a single op; cutting at 10
+                # reproduced the original max_steps failure in regression.
+                # Tunable via ``JCL_PATCHER_READ_ONLY_BAIL`` env.
+                if not step_had_patch_attempt:
+                    self._loop_state["consecutive_query_only_steps"] = (
+                        self._loop_state.get("consecutive_query_only_steps", 0) + 1
+                    )
+                else:
+                    self._loop_state["consecutive_query_only_steps"] = 0
+                if (
+                    self._loop_state.get("consecutive_query_only_steps", 0)
+                        >= DEFAULT_PATCHER_READ_ONLY_BAIL
+                    and not self._loop_state["applied_ops"]
+                ):
+                    reason = (
+                        f"abandoned: "
+                        f"{self._loop_state['consecutive_query_only_steps']} "
+                        f"consecutive read-only steps without ever attempting "
+                        f"a patch — model stuck in exploration mode"
+                    )
+                    break
 
                 # P3C: cumulative scope-escape stop. Checked BEFORE P7B
                 # so that when both conditions hold, the more specific
@@ -2083,6 +2402,12 @@ class SurgicalPatcher:
                 payload["note"] = "no leaf string value contains the keyword"
             return {"content": json.dumps(payload, ensure_ascii=False), "applied": []}
 
+        if name == "find_index":
+            return self._find_index(args)
+
+        if name == "jq":
+            return self._jq(args)
+
         if name == "get_schema":
             ptr = args.get("pointer", "")
             if not self.root_schema:
@@ -2159,6 +2484,12 @@ class SurgicalPatcher:
         if name in ("list_replace_where", "list_remove_where", "list_set_where"):
             return self._list_where(name, args, req)
 
+        if name == "list_str_remove":
+            return self._list_str_remove(args, req)
+
+        if name == "list_move_at":
+            return self._list_move_at(args, req)
+
         if name == "diff":
             # P11: any diff() call satisfies the verify-before-converge
             # gate. We also append an explicit "next action" hint to the
@@ -2170,15 +2501,27 @@ class SurgicalPatcher:
             result = self._diff()
             applied_count = len(self._loop_state.get("applied_ops") or []) if self._loop_state else 0
             if applied_count > 0:
-                payload = json.loads(result["content"])
-                payload["next_action"] = (
-                    "If the before/after pairs above resolve the requirement's "
-                    "intent, call `patch(ops=[])` NOW to converge — do NOT call "
-                    "diff again or run more queries. If the diff reveals the "
-                    "patch missed the intent, fix it with another patch op "
-                    "instead."
-                )
-                result["content"] = json.dumps(payload, ensure_ascii=False)
+                # Try to inject the next_action hint, but the diff
+                # content may be truncated (no longer valid JSON) when
+                # the diff is large. Fall back to an appended hint
+                # instead of crashing the patcher loop.
+                try:
+                    payload = json.loads(result["content"])
+                    payload["next_action"] = (
+                        "If the before/after pairs above resolve the requirement's "
+                        "intent, call `patch(ops=[])` NOW to converge — do NOT call "
+                        "diff again or run more queries. If the diff reveals the "
+                        "patch missed the intent, fix it with another patch op "
+                        "instead."
+                    )
+                    result["content"] = json.dumps(payload, ensure_ascii=False)
+                except json.JSONDecodeError:
+                    result["content"] = (
+                        result["content"]
+                        + "\n\nnext_action: If the diff resolves the intent, "
+                        "call patch(ops=[]) to converge; otherwise emit a "
+                        "corrective patch op."
+                    )
             return result
 
         if name == "undo":
@@ -2341,21 +2684,47 @@ class SurgicalPatcher:
             if isinstance(item, dict) and item.get(key_field) == key_value
         ]
         if not matches:
-            # Surface the candidate keys so the LLM can self-correct.
             seen = sorted({
                 str(it.get(key_field)) for it in target_list
                 if isinstance(it, dict) and key_field in it
             })
-            return {
-                "content": json.dumps(
-                    {
-                        "error": f"no item with {key_field}={key_value!r}",
-                        "available_values": seen[:30],
-                    },
-                    ensure_ascii=False,
-                ),
-                "applied": [],
-            }
+            # P30: weak-model recovery — when key_value is bare int/bool
+            # but the actual labels are strings, scan the intent for any
+            # of the available labels and substitute. Matches the common
+            # tool-call corruption mode where the LLM intended a string
+            # label (e.g. "한수진") but emitted ``key_value: 1``.
+            if (
+                isinstance(key_value, (int, bool))
+                and isinstance(req.intent, str)
+                and seen
+            ):
+                # Find labels that appear in the intent text. When the
+                # critic mentions multiple labels (e.g. naming both
+                # "박동훈-한수진" and the relationship's other parties),
+                # pick the one whose first occurrence comes earliest —
+                # the intent typically leads with the target label.
+                hits = [
+                    (req.intent.find(s), s) for s in seen
+                    if s and s in req.intent
+                ]
+                if hits:
+                    hits.sort()
+                    key_value = hits[0][1]
+                    matches = [
+                        i for i, item in enumerate(target_list)
+                        if isinstance(item, dict) and item.get(key_field) == key_value
+                    ]
+            if not matches:
+                return {
+                    "content": json.dumps(
+                        {
+                            "error": f"no item with {key_field}={key_value!r}",
+                            "available_values": seen[:30],
+                        },
+                        ensure_ascii=False,
+                    ),
+                    "applied": [],
+                }
         # P9: match_policy resolves multi-match into a deterministic
         # set of target indices. Default ``single`` keeps the strict
         # behaviour (good for label-uniqueness invariants); ``all``
@@ -2409,6 +2778,36 @@ class SurgicalPatcher:
                 }
 
         ops: list[dict] = []
+        # P47: when removing list-of-dict items, scan the rest of the
+        # graph for stale ID references in list[str] fields and prepend
+        # ``_cascade``-flagged remove ops so referential integrity is
+        # restored in the same patch. Without this the LLM has to chain
+        # ``list_str_remove`` calls — and historically gave up after a
+        # few rounds, leaving dangling refs.
+        cascade_ops: list[dict] = []
+        if name == "list_remove_where":
+            cascade_ids: set[str] = set()
+            for idx in target_indices:
+                item = target_list[idx]
+                if not isinstance(item, dict):
+                    continue
+                for fname in (key_field, "id"):
+                    v = item.get(fname)
+                    if isinstance(v, str) and v:
+                        cascade_ids.add(v)
+            if cascade_ids:
+                # Exclude the specific items being removed from the
+                # scan — any self-ref inside an about-to-be-removed
+                # dict would just generate wasted cleanup ops. The
+                # rest of the parent list (sibling items) MUST be
+                # scanned — that's where the dangling refs typically
+                # live (e.g. /key_events/B/prerequisite_event_ids
+                # naming /key_events/A's id).
+                excludes = {f"{ptr}/{idx}" for idx in target_indices}
+                cascade_ops = self._scan_id_refs_for_cascade(
+                    cascade_ids, exclude_subtrees=excludes,
+                )
+
         # Build ops in DESCENDING index order so multi-target removes
         # don't suffer from index shift mid-batch.
         for idx in sorted(target_indices, reverse=(name == "list_remove_where")):
@@ -2422,7 +2821,449 @@ class SurgicalPatcher:
                 value = args.get("value")
                 sub_op = "replace" if field in target_list[idx] else "add"
                 ops.append({"op": sub_op, "path": f"{path_at_idx}/{field}", "value": value})
-        return self._apply_ops(ops, req)
+        # Cascade cleanup runs FIRST so the primary remove (which may
+        # shift sibling indices in the parent list) doesn't invalidate
+        # cascade paths. Cascade paths target unrelated list[str] fields,
+        # so they don't conflict with the primary path.
+        return self._apply_ops(cascade_ops + ops, req)
+
+    def _scan_id_refs_for_cascade(
+        self, ids: set[str], *, exclude_subtrees: set[str] | None = None,
+    ) -> list[dict]:
+        """Walk ``self.graph`` for list[str] fields containing any of the
+        given ids; return RFC 6902 ``remove`` ops marked ``_cascade=True``.
+
+        Only matches lists whose entries are ALL strings — list-of-dict
+        traversal continues normally so we don't mis-fire on shape-mixed
+        data. Within each matching list, indices are emitted descending
+        so a single list with multiple stale refs cleans correctly.
+        Across lists, ordering doesn't matter (paths are disjoint).
+        """
+        excludes = exclude_subtrees or set()
+        hits: list[tuple[str, int]] = []
+
+        def walk(node: Any, ptr: str) -> None:
+            for ex in excludes:
+                if ptr == ex or ptr.startswith(ex + "/"):
+                    return
+            if isinstance(node, list):
+                if node and all(isinstance(x, str) for x in node):
+                    for i, s in enumerate(node):
+                        if s in ids:
+                            hits.append((ptr, i))
+                else:
+                    for i, child in enumerate(node):
+                        walk(child, f"{ptr}/{i}")
+            elif isinstance(node, dict):
+                for k, v in node.items():
+                    walk(v, f"{ptr}/{_encode_pointer_token(str(k))}")
+
+        walk(self.graph, "")
+
+        ops: list[dict] = []
+        # Group by list path so reverse-index ordering is preserved
+        # within each list; across lists, paths are disjoint so order
+        # is irrelevant.
+        by_list: dict[str, list[int]] = {}
+        for list_ptr, idx in hits:
+            by_list.setdefault(list_ptr, []).append(idx)
+        for list_ptr, idxs in by_list.items():
+            for idx in sorted(idxs, reverse=True):
+                ops.append({
+                    "op": "remove",
+                    "path": f"{list_ptr}/{idx}",
+                    "_cascade": True,
+                })
+        return ops
+
+    def _find_index(self, args: dict) -> dict:
+        """Read-only lookup: index of a list-of-dicts item by identity field.
+
+        P51: addresses the abandoned-on-insert pattern where the LLM
+        burned its read-only budget chasing "what index is kev-X at?"
+        across `find_values` (returns paths like '/key_events/5/id'
+        that the model has to mentally slice) and `query` calls. With
+        a direct id→int helper, the typical insert flow drops from
+        4-5 read steps to 2.
+
+        Returns ``{"index": N}`` for a single match,
+        ``{"indices": [N, M, ...]}`` for multi-match (information only,
+        not an error — caller can pick), and ``{"error": ...,
+        "available_values": [...]}`` for a miss (so the LLM can spot a
+        typo'd id without another `query` round trip).
+        """
+        ptr = (args.get("pointer", "") or "").rstrip("/")
+        key_field = args.get("key_field")
+        # ``key_value`` is allowed to be ``None`` in principle but in
+        # practice we hard-error since matching None against absent
+        # fields produces brittle results.
+        if not ptr or not key_field or "key_value" not in args:
+            return {
+                "content": json.dumps(
+                    {"error": "find_index requires 'pointer', 'key_field', and 'key_value'"},
+                    ensure_ascii=False,
+                ),
+                "applied": [],
+            }
+        try:
+            target_list = _resolve(self.graph, ptr)
+        except (KeyError, IndexError, ValueError) as exc:
+            return {
+                "content": json.dumps(
+                    {"error": f"list at {ptr!r} not found: {exc}"},
+                    ensure_ascii=False,
+                ),
+                "applied": [],
+            }
+        if not isinstance(target_list, list):
+            return {
+                "content": json.dumps(
+                    {"error": f"target at {ptr!r} is not a list (got {type(target_list).__name__})"},
+                    ensure_ascii=False,
+                ),
+                "applied": [],
+            }
+        key_value = args.get("key_value")
+        matches = [
+            i for i, item in enumerate(target_list)
+            if isinstance(item, dict) and item.get(key_field) == key_value
+        ]
+        if not matches:
+            seen = sorted({
+                str(it.get(key_field)) for it in target_list
+                if isinstance(it, dict) and key_field in it
+            })
+            payload = {
+                "error": f"no item with {key_field}={key_value!r}",
+                "available_values": seen[:30],
+            }
+            return {"content": json.dumps(payload, ensure_ascii=False), "applied": []}
+        if len(matches) == 1:
+            return {
+                "content": json.dumps({"index": matches[0]}, ensure_ascii=False),
+                "applied": [],
+            }
+        return {
+            "content": json.dumps({"indices": matches}, ensure_ascii=False),
+            "applied": [],
+        }
+
+    def _jq(self, args: dict) -> dict:
+        """Run a jq expression against the graph (or scoped subtree).
+
+        Designed to collapse the multi-`query` exploration loop. The
+        most common LLM exploration pattern was: ``query(/list)`` →
+        14× ``query(/list/i)`` to learn each item's id+summary →
+        commit. With jq, the same info comes in one call:
+        ``map({id, summary})`` against the list.
+
+        Errors (compile / runtime) come back as JSON ``{"error": ...}``
+        with the offending expression so the LLM can self-correct on
+        the next call. Result size is bounded by the same 1500-char
+        budget as ``query`` to keep tool-result tokens predictable.
+        """
+        expression = args.get("expression")
+        if not expression or not isinstance(expression, str):
+            return {
+                "content": json.dumps(
+                    {"error": "jq requires non-empty 'expression' (string)"},
+                    ensure_ascii=False,
+                ),
+                "applied": [],
+            }
+        ptr = (args.get("pointer") or "").rstrip("/")
+        try:
+            target = _resolve(self.graph, ptr) if ptr else self.graph
+        except (KeyError, IndexError, ValueError) as exc:
+            return {
+                "content": json.dumps(
+                    {"error": f"pointer {ptr!r} not found: {exc}"},
+                    ensure_ascii=False,
+                ),
+                "applied": [],
+            }
+        try:
+            import jq as _jq_lib  # local import — keeps cold import cheap
+        except ImportError:
+            return {
+                "content": json.dumps(
+                    {"error": "jq library not installed; jq tool unavailable"},
+                    ensure_ascii=False,
+                ),
+                "applied": [],
+            }
+        try:
+            program = _jq_lib.compile(expression)
+        except ValueError as exc:
+            return {
+                "content": json.dumps(
+                    {
+                        "error": f"jq compile error: {exc}",
+                        "expression": expression,
+                        "hint": "verify jq syntax — common pitfalls: "
+                                "string slicing uses `.[0:60]` not `[:60]`, "
+                                "field projection uses `{a, b}` shorthand "
+                                "or `{a: .a, b: .b}`",
+                    },
+                    ensure_ascii=False,
+                ),
+                "applied": [],
+            }
+        try:
+            results = program.input(target).all()
+        except Exception as exc:
+            return {
+                "content": json.dumps(
+                    {
+                        "error": f"jq runtime error: {exc}",
+                        "expression": expression,
+                    },
+                    ensure_ascii=False,
+                ),
+                "applied": [],
+            }
+        # jq 'output stream' semantics: even single-value results come back as
+        # a one-element list. Unwrap when len==1 so callers get the value
+        # directly, but keep the list when there are multiple emissions
+        # (typical for `.[]` style iteration).
+        payload = results[0] if len(results) == 1 else results
+        return {"content": _summarize_for_query(payload, max_chars=1500), "applied": []}
+
+    def _list_str_remove(self, args: dict, req: PatchRequest) -> dict:
+        """Strip every occurrence of ``value`` from a list[str] at ``pointer``.
+
+        Built for the dangling-id-reference pattern: when an item gets
+        removed elsewhere (e.g. /key_events/N), other items' id-list
+        slots (prerequisite_event_ids, assigned_event_ids) still
+        reference the removed id. set_field with whole-list re-emit
+        was the only prior path and reliably caused the LLM to abandon
+        after 5 read-only steps, since "carry every other entry verbatim
+        but drop one specific string" is awkward to encode as a list
+        replacement intent.
+
+        The op resolves the list at call time, builds an indexed-remove
+        chain (highest index first so subsequent removes don't shift),
+        and runs through ``_apply_ops`` for uniform scope guard / undo
+        bookkeeping. No-op (returns ok with removed=0) when the value
+        isn't present — the LLM's intent was idempotent regardless.
+        """
+        ptr = (args.get("pointer", "") or "").rstrip("/")
+        value = args.get("value")
+        if not ptr or value is None:
+            return {
+                "content": json.dumps(
+                    {"error": "list_str_remove requires 'pointer' and 'value'"},
+                    ensure_ascii=False,
+                ),
+                "applied": [],
+            }
+        if not isinstance(value, str):
+            return {
+                "content": json.dumps(
+                    {"error": f"list_str_remove 'value' must be a string, got {type(value).__name__}"},
+                    ensure_ascii=False,
+                ),
+                "applied": [],
+            }
+        # Scope guard mirrors _list_where: pointer must be inside (or an
+        # ancestor of) target_pointer, otherwise count as scope rejection.
+        target = req.target_pointer
+        ptr_is_ancestor_of_target = bool(target) and target.startswith(ptr + "/")
+        if not (
+            self._op_in_scope({"path": ptr}, target) or ptr_is_ancestor_of_target
+        ):
+            state = self._loop_state
+            if state:
+                state["scope_rejections"] = state.get("scope_rejections", 0) + 1
+                paths = state.setdefault("out_of_scope_paths", [])
+                if len(paths) < 10:
+                    paths.append(ptr)
+            return {
+                "content": json.dumps(
+                    {"error": f"pointer {ptr!r} is outside target_pointer "
+                              f"{target!r}; this requirement only allows "
+                              f"edits inside that subtree"},
+                    ensure_ascii=False,
+                ),
+                "applied": [],
+            }
+        try:
+            target_list = _resolve(self.graph, ptr)
+        except (KeyError, IndexError, ValueError) as exc:
+            return {
+                "content": json.dumps(
+                    {"error": f"list at {ptr!r} not found: {exc}"},
+                    ensure_ascii=False,
+                ),
+                "applied": [],
+            }
+        if not isinstance(target_list, list):
+            return {
+                "content": json.dumps(
+                    {"error": f"target at {ptr!r} is not a list "
+                              f"({type(target_list).__name__}); "
+                              f"list_str_remove only operates on list[str]"},
+                    ensure_ascii=False,
+                ),
+                "applied": [],
+            }
+        bad_types = [type(it).__name__ for it in target_list if not isinstance(it, str)]
+        if bad_types:
+            return {
+                "content": json.dumps(
+                    {"error": f"list at {ptr!r} contains non-string elements "
+                              f"({bad_types[:3]}); list_str_remove only operates "
+                              f"on list[str]. Use list_remove_where with key_field "
+                              f"for list-of-dicts."},
+                    ensure_ascii=False,
+                ),
+                "applied": [],
+            }
+        # Find indices to drop. Build remove ops in reverse-index order so
+        # each removal doesn't shift subsequent target indices.
+        to_remove = [i for i, it in enumerate(target_list) if it == value]
+        if not to_remove:
+            # Idempotent no-op — explicit ok signal so the LLM doesn't
+            # interpret silence as "still need to retry".
+            return {
+                "content": json.dumps(
+                    {"ok": True, "removed": 0,
+                     "note": f"value {value!r} not present in list at {ptr!r}; nothing to do"},
+                    ensure_ascii=False,
+                ),
+                "applied": [],
+            }
+        ops = [{"op": "remove", "path": f"{ptr}/{i}"} for i in reversed(to_remove)]
+        result = self._apply_ops(ops, req)
+        # Decorate the response so the LLM sees an explicit removed-count.
+        try:
+            payload = json.loads(result["content"])
+            if isinstance(payload, dict):
+                payload["removed"] = len(to_remove)
+                result["content"] = json.dumps(payload, ensure_ascii=False)
+        except (json.JSONDecodeError, KeyError):
+            pass
+        return result
+
+    def _list_move_at(self, args: dict, req: PatchRequest) -> dict:
+        """Move one list element from ``from_index`` to ``to_index``.
+
+        Why a dedicated op: the only prior path was ``remove`` +
+        ``insert_at``, which (a) tripped the scope guard twice for one
+        logical intent and (b) made the LLM compute the post-removal
+        destination index, a known foot-gun. ``to_index`` here is the
+        FINAL position the moved item occupies in the result list —
+        e.g. moving 0→3 in [a,b,c,d,e] yields [b,c,d,a,e]. The helper
+        translates that to the indexed remove + add pair internally.
+        """
+        ptr = (args.get("pointer", "") or "").rstrip("/")
+        from_idx = args.get("from_index")
+        to_idx = args.get("to_index")
+        if not ptr or from_idx is None or to_idx is None:
+            return {
+                "content": json.dumps(
+                    {"error": "list_move_at requires 'pointer', 'from_index', and 'to_index'"},
+                    ensure_ascii=False,
+                ),
+                "applied": [],
+            }
+        try:
+            from_idx = int(from_idx)
+            to_idx = int(to_idx)
+        except (TypeError, ValueError):
+            return {
+                "content": json.dumps(
+                    {"error": f"list_move_at indices must be integers; got "
+                              f"from={from_idx!r}, to={to_idx!r}"},
+                    ensure_ascii=False,
+                ),
+                "applied": [],
+            }
+        # Scope guard parity with other _list_* helpers.
+        target = req.target_pointer
+        ptr_is_ancestor_of_target = bool(target) and target.startswith(ptr + "/")
+        if not (
+            self._op_in_scope({"path": ptr}, target) or ptr_is_ancestor_of_target
+        ):
+            state = self._loop_state
+            if state:
+                state["scope_rejections"] = state.get("scope_rejections", 0) + 1
+                paths = state.setdefault("out_of_scope_paths", [])
+                if len(paths) < 10:
+                    paths.append(ptr)
+            return {
+                "content": json.dumps(
+                    {"error": f"pointer {ptr!r} is outside target_pointer "
+                              f"{target!r}; this requirement only allows "
+                              f"edits inside that subtree"},
+                    ensure_ascii=False,
+                ),
+                "applied": [],
+            }
+        try:
+            target_list = _resolve(self.graph, ptr)
+        except (KeyError, IndexError, ValueError) as exc:
+            return {
+                "content": json.dumps(
+                    {"error": f"list at {ptr!r} not found: {exc}"},
+                    ensure_ascii=False,
+                ),
+                "applied": [],
+            }
+        if not isinstance(target_list, list):
+            return {
+                "content": json.dumps(
+                    {"error": f"target at {ptr!r} is not a list "
+                              f"({type(target_list).__name__}); "
+                              f"list_move_at only operates on lists"},
+                    ensure_ascii=False,
+                ),
+                "applied": [],
+            }
+        n = len(target_list)
+        if not (0 <= from_idx < n) or not (0 <= to_idx < n):
+            return {
+                "content": json.dumps(
+                    {"error": f"index out of range: list at {ptr!r} has length {n}, "
+                              f"got from={from_idx}, to={to_idx}"},
+                    ensure_ascii=False,
+                ),
+                "applied": [],
+            }
+        if from_idx == to_idx:
+            return {
+                "content": json.dumps(
+                    {"ok": True, "moved": 0, "note": "from_index == to_index — no-op"},
+                    ensure_ascii=False,
+                ),
+                "applied": [],
+            }
+        # to_idx is the FINAL position. After popping from_idx, the list
+        # has length n-1 and indices ≥ from_idx have shifted down by 1.
+        # The insert position in the popped list that yields the desired
+        # final position is to_idx itself when to_idx ≤ from_idx, and
+        # to_idx (in the popped list, which now indexes one less) when
+        # to_idx > from_idx — but since the popped list is what the
+        # insert acts on, and final position == post-insert index, the
+        # correct post-pop insert index is just to_idx in both cases
+        # (it lands at exactly to_idx in the result regardless of
+        # direction, because pop+insert is commutative around the gap).
+        item = target_list[from_idx]
+        ops = [
+            {"op": "remove", "path": f"{ptr}/{from_idx}"},
+            {"op": "add", "path": f"{ptr}/{to_idx}", "value": item},
+        ]
+        result = self._apply_ops(ops, req)
+        try:
+            payload = json.loads(result["content"])
+            if isinstance(payload, dict):
+                payload["moved"] = 1
+                payload["from_index"] = from_idx
+                payload["to_index"] = to_idx
+                result["content"] = json.dumps(payload, ensure_ascii=False)
+        except (json.JSONDecodeError, KeyError):
+            pass
+        return result
 
     # diff / undo ------------------------------------------------------
 
@@ -2530,6 +3371,14 @@ class SurgicalPatcher:
         applied: list[dict] = []
         errors: list[str] = []
         notes: list[str] = []
+        # P25: for multi-op patches, defer per-op patch_evaluator. The
+        # evaluator sees only the marginal effect of each op — for
+        # additive intents ("add A and B") each op individually scores
+        # "partial" and used to be rolled back, deadlocking the loop.
+        # Instead we evaluate the patch as a whole post-application.
+        # Snapshot taken before any op in the batch lands.
+        is_multi_op = len(ops) > 1
+        pre_batch_snapshot = copy.deepcopy(self.graph) if is_multi_op else None
         for i, op in enumerate(ops):
             try:
                 # P14: any per-op pre-check (translate, path-finder,
@@ -2550,10 +3399,23 @@ class SurgicalPatcher:
                 op = translated
                 # Path-finder sub-agent (auto-invoked, before scope check).
                 # Confirms or corrects the proposed path. May rewrite op["path"].
-                finder_note = self._invoke_path_finder(i, op, req, state)
-                if finder_note:
-                    notes.append(f"op[{i}]: {finder_note}")
-                if not self._op_in_scope(op, req.target_pointer):
+                # Skipped for cascade ops — their paths are computed from a
+                # deterministic graph scan (P47), not LLM proposal, so
+                # asking an LLM to second-guess them just burns tokens
+                # and risks rewriting a verified-correct pointer.
+                if not op.get("_cascade"):
+                    finder_note = self._invoke_path_finder(i, op, req, state)
+                    if finder_note:
+                        notes.append(f"op[{i}]: {finder_note}")
+                # ``_cascade``: True is set internally when a higher-level
+                # tool (currently ``list_remove_where``) auto-emits referential
+                # cleanup ops alongside its primary remove. The cleanup ops
+                # touch paths outside the original target_pointer by design
+                # (they reach into other items' id-list slots) and would
+                # otherwise be rejected as scope escapes. We trust the
+                # cascade because it is BUILT BY THE PATCHER ITSELF, not
+                # the LLM, on the basis of the now-removed item's id.
+                if not op.get("_cascade") and not self._op_in_scope(op, req.target_pointer):
                     errors.append(
                         f"op[{i}] path {op.get('path')!r} outside target_pointer "
                         f"{req.target_pointer!r}"
@@ -2567,7 +3429,7 @@ class SurgicalPatcher:
                 # P15: enum/const pre-flight against root_schema. Stops
                 # Literal-typed field violations from poisoning the
                 # whole iteration via post-iteration pydantic validation.
-                schema_err = self._validate_op_value_against_schema(op)
+                schema_err = self._validate_op_value_against_schema(op, req)
                 if schema_err:
                     errors.append(f"op[{i}] schema-rejected at {op.get('path')!r}: {schema_err}")
                     continue
@@ -2586,19 +3448,23 @@ class SurgicalPatcher:
                 # P11: any new in-scope landing invalidates prior diff
                 # verification — must re-audit before declaring done.
                 state["diff_verified_since_last_patch"] = False
-            # Patch-evaluator sub-agent (auto-invoked, after op landed).
-            # Records verdict in trace. P18: when verdict is negative
-            # (no-op / off-target / partial) at high/medium confidence,
-            # ROLL BACK the op — the previous "note-only, let LLM
-            # decide" behaviour was systematically ignored by the
-            # patcher LLM, so bad patches landed as success.
+            # P25: skip per-op evaluator for multi-op patches (handled
+            # once after the loop). For single-op patches, keep per-op
+            # evaluation but only roll back on "off-target".
+            # "partial" means real progress; "no-op" verdicts have a
+            # high false-positive rate (the evaluator misses small but
+            # real text additions like adding a substring), so trust
+            # the change and let the convergence gate's cumulative
+            # re-eval (P26) catch genuine no-progress.
+            if is_multi_op:
+                continue
             eval_note, eval_verdict, eval_conf = self._invoke_patch_evaluator(
                 i, op, req, snapshot, state,
             )
             if eval_note:
                 notes.append(f"op[{i}]: {eval_note}")
             should_rollback = (
-                eval_verdict in ("no-op", "off-target", "partial")
+                eval_verdict == "off-target"
                 and eval_conf in ("high", "medium")
             )
             if should_rollback:
@@ -2619,6 +3485,39 @@ class SurgicalPatcher:
                 errors.append(
                     f"op[{i}] rolled back by patch_evaluator: "
                     f"{eval_verdict} ({eval_conf}) — emit a different op"
+                )
+        # P25: batch evaluation for multi-op patches. Evaluate the whole
+        # patch's net effect against the intent, not each op in isolation.
+        if is_multi_op and applied:
+            synthetic_op = {
+                "op": "batch",
+                "path": req.target_pointer,
+                "n_ops": len(applied),
+            }
+            eval_note, eval_verdict, eval_conf = self._invoke_patch_evaluator(
+                0, synthetic_op, req, pre_batch_snapshot, state,
+            )
+            if eval_note:
+                notes.append(f"batch: {eval_note}")
+            # Roll back the entire batch only when the evaluator says
+            # the whole patch missed the intent (off-target/no-op).
+            # "partial" is fine — the LLM made progress; let convergence
+            # gate ask for more.
+            if eval_verdict in ("no-op", "off-target") and eval_conf in ("high", "medium"):
+                self.graph.clear()
+                self.graph.update(pre_batch_snapshot)
+                if state:
+                    n_to_pop = len(applied)
+                    for _ in range(n_to_pop):
+                        if state["applied_ops"]:
+                            state["applied_ops"].pop()
+                        if state["pre_op_snapshots"]:
+                            state["pre_op_snapshots"].pop()
+                    state["evaluator_rollbacks"] = state.get("evaluator_rollbacks", 0) + 1
+                applied.clear()
+                errors.append(
+                    f"batch rolled back by patch_evaluator: "
+                    f"{eval_verdict} ({eval_conf}) — try a different approach"
                 )
         payload: dict[str, Any] = {"applied": len(applied), "rejected": errors}
         if notes:
@@ -2927,6 +3826,38 @@ class SurgicalPatcher:
             f"or adjust as needed)\n```json\n{seed_json}\n```\n"
         )
 
+    def _cumulative_eval_addressed(self, req: PatchRequest) -> bool:
+        """P26: re-evaluate the full applied-ops diff against the intent.
+
+        Per-op patch_evaluator sees only marginal effects. For additive
+        intents, each op individually is "partial" even when the cumulative
+        effect addresses the intent. Before refusing convergence on
+        unresolved partials, ask the evaluator once on the whole
+        (initial_snapshot → current_graph) diff.
+        """
+        from json_correction_loop.patch_evaluator import (
+            evaluate_patch, EvaluatePatchResult,
+        )
+        initial = self._loop_state.get("initial_snapshot")
+        if initial is None:
+            return False
+        try:
+            r: EvaluatePatchResult = evaluate_patch(
+                initial, self.graph,
+                intent=req.intent,
+                patched_path=req.target_pointer or "",
+                op_kind="batch",
+                client=self.client, model=self.model,
+            )
+        except Exception as exc:
+            logger.warning("cumulative patch_evaluator raised: %s", exc)
+            return False
+        log_verbose(
+            f"    [dim]· cumulative patch_evaluator: {r.verdict} "
+            f"({r.confidence}) {r.rationale[:80]}[/dim]"
+        )
+        return r.verdict == "addressed" and r.confidence in ("high", "medium")
+
     def _unresolved_negative_eval_paths(self) -> list[tuple[str, str]]:
         """P21: per-path latest evaluator verdict. Return paths whose
         most recent verdict is negative (no-op/off-target/partial) at
@@ -2973,7 +3904,9 @@ class SurgicalPatcher:
         path = op.get("path", "")
         return path == target or path.startswith(target + "/")
 
-    def _validate_op_value_against_schema(self, op: dict) -> str | None:
+    def _validate_op_value_against_schema(
+        self, op: dict, req: PatchRequest | None = None
+    ) -> str | None:
         """P15: pre-flight check that ``op['value']`` satisfies enum/const
         constraints in ``self.root_schema`` at ``op['path']``.
 
@@ -3026,5 +3959,52 @@ class SurgicalPatcher:
         # We support both single-type and ``["string", "null"]`` forms.
         type_err = _typecheck_json_schema(node, value)
         if type_err:
+            # P29: auto-coerce list[str] → ", ".join(...) when schema
+            # expects string. Some models persistently emit a JSON list
+            # for fields whose schema is `string` (typical_occupants,
+            # routine content) and won't self-correct even after the
+            # tool result and P27's warning. Coercing in-place lets the
+            # patch land instead of bailing on schema rejection.
+            schema_types = node.get("type")
+            if isinstance(schema_types, str):
+                allowed = {schema_types}
+            elif isinstance(schema_types, list):
+                allowed = set(schema_types)
+            else:
+                allowed = set()
+            if (
+                "string" in allowed
+                and isinstance(value, list)
+                and all(isinstance(x, (str, int, float)) for x in value)
+            ):
+                # Guard: refuse to coerce when the list looks like a
+                # mis-emitted JSON Patch op flattened into a value list
+                # (model bug: ``value: ["op", "replace", "path", ...]``).
+                # Coercing would write nonsense like "op, replace, path"
+                # into the field. Detect by a JSON-Patch keyword in
+                # any of the first few entries.
+                jp_kw = {"op", "replace", "add", "remove", "path", "from", "test"}
+                first_few = {str(x).strip().lower() for x in value[:6]}
+                if not (first_few & jp_kw):
+                    op["value"] = ", ".join(str(x) for x in value)
+                    return None
+            # P30: when schema expects string but the LLM emitted a
+            # bare int / bool (commonly observed as ``value: 1`` from
+            # corrupted tool-call args on weak models), try to recover
+            # by extracting the first single-quoted string from the
+            # requirement's intent. The intent reliably carries the
+            # author's literal target value as ``... '<value>' ...``
+            # in the suggestion (e.g. "X를 '대상값'으로 변경").
+            if (
+                "string" in allowed
+                and isinstance(value, (int, bool))
+                and req is not None
+                and isinstance(req.intent, str)
+            ):
+                import re
+                m = re.search(r"'([^']{2,300})'", req.intent)
+                if m:
+                    op["value"] = m.group(1)
+                    return None
             return type_err
         return None

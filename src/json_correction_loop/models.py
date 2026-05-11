@@ -73,6 +73,23 @@ class CriticReport(BaseModel):
     convergence_reason: str | None = None
     approved: bool = False
 
+    @classmethod
+    def __get_pydantic_json_schema__(cls, schema, handler):
+        # Force ``issues`` and ``approved`` into the LLM-facing
+        # ``required`` list. Python defaults stay so existing
+        # constructors (synthetic empty-issues fallbacks etc.) keep
+        # working — but the LLM can no longer silently omit either
+        # field, which previously let "approved=false, issues=()"
+        # responses slip through as auto-approval (``total==0`` gate
+        # ignored the missing ``approved`` flag).
+        s = handler(schema)
+        req = list(s.get("required", []))
+        for k in ("issues", "approved"):
+            if k not in req:
+                req.append(k)
+        s["required"] = req
+        return s
+
 
 class SkippedIssue(BaseModel):
     """One issue the planner dropped, with structural justification."""

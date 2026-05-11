@@ -191,12 +191,26 @@ def run_correction_loop(
                 "assessment": (r.overall_assessment or "")[:120],
             }))
 
-        if total == 0:
+        all_approved = all(r.approved for r in reports)
+        if total == 0 and all_approved:
             config.events.emit(Event("approved", {"iter": i}))
             loop_converged_outcome = True
             _stamp_outcome()
             config.events.emit(Event("loop_end", {"reason": "approved"}))
             return True
+
+        if total == 0 and not all_approved:
+            # Critic withheld approval but listed no issues — malformed
+            # response (the prompt's APPROVAL RULE pairs the two: empty
+            # ``issues`` ⇒ ``approved=true``). With nothing actionable,
+            # keep going so the next iter's critic call gets a fresh
+            # chance; if it persists, max_loops/hardcap terminates.
+            config.events.emit(Event("malformed_critic", {
+                "iter": i,
+                "reason": "approved=false but issues=[]",
+                "scores": [r.score for r in reports],
+            }))
+            continue
 
         if convergence_tag == "converged":
             config.events.emit(Event("converged", {"reason": early_exit_reason}))

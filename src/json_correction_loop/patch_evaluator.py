@@ -260,7 +260,7 @@ def evaluate_patch(
                 tool_choice="auto",
                 temperature=0.1,
                 max_tokens=2048,
-                extra={"reasoning_effort": os.environ.get("JCL_REASONING_EFFORT", "none").strip() or "none"},
+                extra=({"reasoning_effort": e} if (e := (os.environ.get("JCL_REASONING_EFFORT", "none").strip() or "none")) and e != "none" else {}),
             )
         except TransientLLMError as exc:
             logger.warning("patch_evaluator transient error: %s", exc)

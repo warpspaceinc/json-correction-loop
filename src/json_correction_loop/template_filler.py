@@ -337,7 +337,7 @@ def fill_template(
                 temperature=0.1,
                 max_tokens=4096,
                 response_format=response_format,
-                extra={"reasoning_effort": os.environ.get("JCL_REASONING_EFFORT", "none").strip() or "none"},
+                extra=({"reasoning_effort": e} if (e := (os.environ.get("JCL_REASONING_EFFORT", "none").strip() or "none")) and e != "none" else {}),
             )
         except SchemaRejectedError as exc:
             last_exc = exc

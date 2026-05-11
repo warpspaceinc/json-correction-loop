@@ -149,6 +149,41 @@ _TOOL_SCHEMAS = [
     {
         "type": "function",
         "function": {
+            "name": "jq",
+            "description": (
+                "Run a jq expression against the graph (or a subtree). "
+                "Use this for bulk projection / filtering when the "
+                "intent points at many items at once. Examples:\n"
+                "  • `.key_events | map({id, summary: .summary[:60]})` "
+                "→ id+brief for every event in one call\n"
+                "  • `.key_events | map(select(.act_number == 2)) | "
+                "map(.id)` → ids of every act-2 event\n"
+                "  • `.spaces | keys` → list every space label.\n"
+                "Read-only. Errors come back with the offending "
+                "expression so you can correct on the next call."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "expression": {
+                        "type": "string",
+                        "description": "jq expression to evaluate.",
+                    },
+                    "pointer": {
+                        "type": "string",
+                        "description": (
+                            "Optional JSON Pointer to scope the input "
+                            "(empty = whole graph)."
+                        ),
+                    },
+                },
+                "required": ["expression"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
             "name": "answer",
             "description": (
                 "Final answer. Call exactly once when you've identified "
@@ -353,7 +388,7 @@ def find_target(
                 tool_choice="auto",
                 temperature=0.1,
                 max_tokens=2048,
-                extra={"reasoning_effort": os.environ.get("JCL_REASONING_EFFORT", "none").strip() or "none"},
+                extra=({"reasoning_effort": e} if (e := (os.environ.get("JCL_REASONING_EFFORT", "none").strip() or "none")) and e != "none" else {}),
             )
         except TransientLLMError as exc:
             logger.warning("path_finder transient error: %s", exc)
@@ -500,6 +535,45 @@ def _dispatch_readonly(
         keyword = args.get("keyword", "")
         results = _find_values(graph, keyword, max_results=20)
         return json.dumps({"matches": results}, ensure_ascii=False)
+
+    if name == "jq":
+        expression = args.get("expression")
+        if not expression or not isinstance(expression, str):
+            return json.dumps(
+                {"error": "jq requires non-empty 'expression' (string)"},
+                ensure_ascii=False,
+            )
+        ptr = (args.get("pointer") or "").rstrip("/")
+        try:
+            target = _resolve(graph, ptr) if ptr else graph
+        except (KeyError, IndexError, ValueError) as exc:
+            return json.dumps(
+                {"error": f"pointer {ptr!r} not found: {exc}"},
+                ensure_ascii=False,
+            )
+        try:
+            import jq as _jq_lib
+        except ImportError:
+            return json.dumps(
+                {"error": "jq library not installed"},
+                ensure_ascii=False,
+            )
+        try:
+            program = _jq_lib.compile(expression)
+        except ValueError as exc:
+            return json.dumps(
+                {"error": f"jq compile error: {exc}", "expression": expression},
+                ensure_ascii=False,
+            )
+        try:
+            results = program.input(target).all()
+        except Exception as exc:
+            return json.dumps(
+                {"error": f"jq runtime error: {exc}", "expression": expression},
+                ensure_ascii=False,
+            )
+        payload = results[0] if len(results) == 1 else results
+        return _summarize_for_query(payload, max_chars=1500)
 
     return json.dumps({"error": f"unknown tool {name!r}"}, ensure_ascii=False)
 
