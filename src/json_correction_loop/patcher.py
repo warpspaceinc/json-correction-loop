@@ -1680,18 +1680,32 @@ def _js_to_python(value: Any) -> Any:
     lists / dicts so the result is JSON-serializable.
 
     Primitives (str/int/float/bool/None) come back as native Python
-    already and pass through. Anything we don't recognise is returned
-    unchanged — the JSON dumper will surface the error if it can't
-    handle it.
+    already and pass through. ``JSUndefined`` becomes ``None``
+    (Python has no separate ``undefined``), and other JS-only proxy
+    types (functions, symbols, promises) collapse to their ``repr``
+    so json.dumps doesn't crash — losing structure but keeping the
+    result inspectable.
     """
     try:
-        from py_mini_racer._objects import JSArrayImpl, JSMappedObjectImpl
+        from py_mini_racer._objects import (
+            JSArrayImpl,
+            JSMappedObjectImpl,
+            JSUndefinedType,
+        )
     except ImportError:
         return value
+    if isinstance(value, JSUndefinedType):
+        return None
     if isinstance(value, JSArrayImpl):
         return [_js_to_python(x) for x in value]
     if isinstance(value, JSMappedObjectImpl):
         return {k: _js_to_python(value[k]) for k in value.keys()}
+    # Anything else that came from V8 but isn't a primitive — e.g.
+    # JSFunctionImpl, JSSymbolImpl, JSPromiseImpl. json.dumps can't
+    # serialize them; render the repr so the LLM can see the result
+    # is a non-data value (e.g. it expected a value but got a function).
+    if type(value).__module__.startswith("py_mini_racer"):
+        return f"<{type(value).__name__}: {value!r}>"
     return value
 
 

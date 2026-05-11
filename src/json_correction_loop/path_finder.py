@@ -317,7 +317,14 @@ def find_target(
         _trim_schema_for_llm,
     )
 
-    if os.environ.get("JCL_PATH_FINDER_ENABLED", "1").strip() not in ("1", "true", "True", "yes"):
+    # P61: default flipped 1 → 0 after the ablation benchmark (5
+    # fixtures, on/off): pass rate identical, wall-clock 55-78%
+    # shorter, calls 50-77% fewer. 95.5% of path_finder invocations
+    # in the prior trace pool only CONFIRMED the proposal (no
+    # rewrite); the natural feedback loop (op fails → LLM corrects
+    # from error msg) catches the remaining 4.5%. Opt back in with
+    # ``JCL_PATH_FINDER_ENABLED=1``.
+    if os.environ.get("JCL_PATH_FINDER_ENABLED", "0").strip() not in ("1", "true", "True", "yes"):
         # Disabled — pass through the proposal as-is.
         return FindTargetResult(
             pointer=proposed_path,
