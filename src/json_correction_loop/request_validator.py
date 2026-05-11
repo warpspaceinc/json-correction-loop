@@ -276,7 +276,16 @@ def validate_request(
         _summarize_for_query,
     )
 
-    if os.environ.get("JCL_REQUEST_VALIDATOR_ENABLED", "1").strip() not in ("1", "true", "True", "yes"):
+    # P62: default flipped 1 → 0. Audit across 550 invocations
+    # (production trace pool): 74.5% hit max_steps without producing a
+    # verdict (returning the safe ``valid (low)`` default after burning
+    # 6 LLM sub-calls), 15.8% confirmed valid (high), only 3.6%
+    # rejected as too_broad/spurious/ambiguous. The 96.4% of cases
+    # where the validator either bailed or confirmed are pure overhead
+    # — main patcher would have done the same work via its own
+    # convergence path. Opt back in with
+    # ``JCL_REQUEST_VALIDATOR_ENABLED=1``.
+    if os.environ.get("JCL_REQUEST_VALIDATOR_ENABLED", "0").strip() not in ("1", "true", "True", "yes"):
         return ValidateRequestResult(
             verdict="valid",
             confidence="low",
