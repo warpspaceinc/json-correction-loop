@@ -60,8 +60,10 @@ slots:
   the slice of state implicated by flagged paths — turns out to be a
   *correctness* component, not just a cost optimization (we measured
   this; see [Discussion #1][disc1]).
-- **Surgical patcher** emits RFC 6902 ops via tool calling, validated
-  and applied with a standard JSON Patch library.
+- **Surgical patcher** emits RFC 6902 ops via tool calling, applied
+  through a minimal inline RFC 6902 implementation
+  (`add`/`replace`/`remove` only — `move`/`copy` are rejected by
+  design).
 - **Convergence policies** (quality-stable, hardcap) compose as
   Protocols.
 
@@ -77,7 +79,14 @@ in.
 pip install json-correction-loop
 ```
 
-Requires Python 3.11+. Pydantic 2.x is the only runtime dependency.
+Requires Python 3.11+. Runtime dependencies:
+
+- `pydantic>=2.0` — models / structured output.
+- `jq>=1.6` — used by `SurgicalPatcher`'s `jq` tool for bulk graph
+  queries. PyPI wheels ship libjq; no system `jq` needed.
+- `mini-racer>=0.12` — embedded V8 used by `SurgicalPatcher`'s
+  `javascript` tool. No Node.js needed.
+
 For development:
 
 ```bash
