@@ -301,6 +301,14 @@ def fill_template(
         {"role": "user", "content": user_prompt},
     ]
 
+    # Gemini's responseSchema only accepts a narrow OpenAPI 3.0 subset
+    # ($defs/$ref, anyOf, additionalProperties:false all 400). Rewrite up
+    # front so the first attempt actually succeeds — saves the mandatory
+    # ~1.5s schema-rejection retry per call on Gemini-routed runs.
+    from json_correction_loop.llm.schema_compat import is_gemini_model, sanitize_for_gemini
+    if is_gemini_model(chosen_model):
+        envelope_schema = sanitize_for_gemini(envelope_schema)
+
     # If schema has unsupported features, route directly to json_object.
     skip_json_schema = _schema_has_property_names(envelope_schema)
 

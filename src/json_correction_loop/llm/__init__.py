@@ -23,6 +23,10 @@ from json_correction_loop.llm.exceptions import (
     SchemaRejectedError,
     TransientLLMError,
 )
+from json_correction_loop.llm.schema_compat import (
+    is_gemini_model,
+    sanitize_for_gemini,
+)
 
 __all__ = [
     "ChatResponse",
@@ -34,4 +38,6 @@ __all__ = [
     "ToolCallFunction",
     "TransientLLMError",
     "Usage",
+    "is_gemini_model",
+    "sanitize_for_gemini",
 ]
