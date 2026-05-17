@@ -32,6 +32,13 @@ PlannerKindStr = Literal["identity", "llm"]
 / oscillation filter) or an LLM call."""
 
 
+_MAX_TARGET_IDS = 20
+"""Server-side ceiling on issue.target_ids length. Mirrors the schema-level
+``maxItems`` so degenerate LLM responses that ignore the schema cap (or
+land in a json_object-fallback path where it was dropped) still get
+clamped after the fact."""
+
+
 class CriticIssue(BaseModel):
     """One defect a critic flagged.
 
@@ -39,15 +46,22 @@ class CriticIssue(BaseModel):
     slots without forcing the LLM to pack them into one string (the old
     ``target_id: str`` shape kept tempting models to comma-join ids and
     then expand the comma-list into a degenerate output loop). The
-    before-validator tolerates legacy scalar / comma-string emits.
+    before-validator tolerates legacy scalar / comma-string emits and
+    enforces both uniqueness and the ``_MAX_TARGET_IDS`` ceiling so the
+    list-form can't be abused as a different degenerate path
+    (e.g. emitting the same id thousands of times).
     """
     target_ids: list[str] = Field(
         default_factory=list,
         description=(
-            "Slot ids this defect targets. Emit as a JSON array. A single "
-            "id is still a 1-element list. Never comma-join ids inside one "
-            "element — host enums constrain each item to its catalog."
+            "Slot ids this defect targets. Emit as a JSON array of UNIQUE "
+            "ids. A single id is still a 1-element list. Never comma-join "
+            "ids inside one element — host enums constrain each item to "
+            "its catalog. Do not repeat the same id; do not emit more than "
+            "20 ids in one issue (split into multiple issues if needed)."
         ),
+        max_length=20,
+        json_schema_extra={"uniqueItems": True, "maxItems": 20},
     )
     severity: SeverityStr = ""
     issue_type: str = ""
@@ -68,14 +82,28 @@ class CriticIssue(BaseModel):
         # Accept legacy scalar / comma-separated string emits so backends
         # whose schema-enum constraint was downgraded to free-form (e.g.
         # json_object fallback) still parse cleanly. List-of-strings is
-        # the canonical shape.
+        # the canonical shape. Dedup while preserving first-occurrence
+        # order, and clamp to ``_MAX_TARGET_IDS`` so degenerate LLM
+        # responses that emit the same id thousands of times can't bypass
+        # the schema-level ``uniqueItems`` / ``maxItems`` constraints.
         if v is None or v == "":
             return []
         if isinstance(v, str):
-            return [s.strip() for s in v.split(",") if s.strip()]
-        if isinstance(v, list):
-            return [s.strip() for s in v if isinstance(s, str) and s.strip()]
-        return v
+            items = [s.strip() for s in v.split(",") if s.strip()]
+        elif isinstance(v, list):
+            items = [s.strip() for s in v if isinstance(s, str) and s.strip()]
+        else:
+            return v
+        seen: set[str] = set()
+        deduped: list[str] = []
+        for item in items:
+            if item in seen:
+                continue
+            seen.add(item)
+            deduped.append(item)
+            if len(deduped) >= _MAX_TARGET_IDS:
+                break
+        return deduped
 
     @model_validator(mode="before")
     @classmethod
