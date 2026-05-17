@@ -145,7 +145,11 @@ def run_correction_loop(
         total = merged_critical + merged_major + merged_minor
 
         target_set = frozenset(
-            iss.target_id for r in reports for iss in r.issues if iss.target_id
+            tid
+            for r in reports
+            for iss in r.issues
+            for tid in (iss.target_ids or [])
+            if tid
         )
 
         convergence_tag = ""

@@ -12,7 +12,7 @@ from __future__ import annotations
 
 from typing import Any, Literal
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, field_validator, model_validator
 
 
 SeverityStr = Literal["", "critical", "major", "minor"]
@@ -33,8 +33,22 @@ PlannerKindStr = Literal["identity", "llm"]
 
 
 class CriticIssue(BaseModel):
-    """One defect a critic flagged."""
-    target_id: str = ""
+    """One defect a critic flagged.
+
+    ``target_ids`` is a list so a single defect can name several affected
+    slots without forcing the LLM to pack them into one string (the old
+    ``target_id: str`` shape kept tempting models to comma-join ids and
+    then expand the comma-list into a degenerate output loop). The
+    before-validator tolerates legacy scalar / comma-string emits.
+    """
+    target_ids: list[str] = Field(
+        default_factory=list,
+        description=(
+            "Slot ids this defect targets. Emit as a JSON array. A single "
+            "id is still a 1-element list. Never comma-join ids inside one "
+            "element — host enums constrain each item to its catalog."
+        ),
+    )
     severity: SeverityStr = ""
     issue_type: str = ""
     description: str = ""
@@ -47,6 +61,42 @@ class CriticIssue(BaseModel):
     # "patcher: scope_mismatch — ...").
     invalidated: bool = False
     invalidation_reason: str = ""
+
+    @field_validator("target_ids", mode="before")
+    @classmethod
+    def _coerce_target_ids(cls, v: Any) -> Any:
+        # Accept legacy scalar / comma-separated string emits so backends
+        # whose schema-enum constraint was downgraded to free-form (e.g.
+        # json_object fallback) still parse cleanly. List-of-strings is
+        # the canonical shape.
+        if v is None or v == "":
+            return []
+        if isinstance(v, str):
+            return [s.strip() for s in v.split(",") if s.strip()]
+        if isinstance(v, list):
+            return [s.strip() for s in v if isinstance(s, str) and s.strip()]
+        return v
+
+    @model_validator(mode="before")
+    @classmethod
+    def _absorb_legacy_target_id(cls, data: Any) -> Any:
+        # Phase-by-phase migration: until every host prompt is rewritten
+        # to emit ``target_ids: [...]``, accept ``target_id: "..."`` from
+        # legacy emissions and promote it to a singleton list. Once all
+        # host phases are migrated, this can be deleted.
+        if isinstance(data, dict) and "target_ids" not in data and "target_id" in data:
+            v = data.pop("target_id")
+            if isinstance(v, str) and v.strip():
+                data["target_ids"] = [v.strip()]
+        return data
+
+    @property
+    def target_id(self) -> str:
+        """Backward-compat read accessor for callers that still expect a
+        single ``target_id``. Returns the first element or empty string.
+        New code should iterate ``target_ids`` directly.
+        """
+        return self.target_ids[0] if self.target_ids else ""
 
 
 class CriticReport(BaseModel):

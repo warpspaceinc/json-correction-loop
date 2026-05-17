@@ -75,10 +75,11 @@ def make_identity_planner(target_id_parser: TargetIdParser) -> PlannerFn:
             )
         first_issue_by_target: dict[str, CriticIssue] = {}
         for iss in all_issues:
-            tid = (iss.target_id or "").strip()
-            if not tid:
-                continue
-            first_issue_by_target.setdefault(tid, iss)
+            for raw in iss.target_ids or []:
+                tid = (raw or "").strip()
+                if not tid:
+                    continue
+                first_issue_by_target.setdefault(tid, iss)
         corrections: list[Correction] = []
         for slot in flagged_paths:
             iss = first_issue_by_target.get(slot)
@@ -128,7 +129,10 @@ def make_oscillation_aware_planner(
         for c in plan.corrections:
             tid = c.requirement_id
             present_in_all = all(
-                any((iss.target_id or "").strip() == tid for iss in (h.issues or []))
+                any(
+                    tid in {(t or "").strip() for t in (iss.target_ids or [])}
+                    for iss in (h.issues or [])
+                )
                 for h in recent
             )
             if present_in_all:
