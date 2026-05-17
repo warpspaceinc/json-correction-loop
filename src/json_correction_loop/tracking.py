@@ -45,7 +45,9 @@ class CallRecord:
     level: str = ""        # full phase id, e.g. "scenes.subdivide"
     purpose: str = ""      # sub-step within the phase, e.g. "subdivide.outline"
     actual_cost: float | None = None  # filled by cost_lookup_fn
-    timestamp: str = ""
+    timestamp: str = ""           # call-end (recorded in record())
+    started_at: str = ""          # call-start ISO, set by caller via record(start_ts=...)
+    latency_ms: int | None = None  # end − start in milliseconds; None when start unknown
     system_prompt: str = ""
     user_prompt: str = ""
     response_content: str = ""
@@ -141,6 +143,7 @@ class UsageTracker:
         request_id: str = "", response_content: str = "",
         kind: str = "exception",
         extra: dict | None = None,
+        start_ts: datetime | None = None,
     ) -> None:
         """Persist a failed LLM interaction. ``kind`` distinguishes
         exception / empty_choices / parse_failure / truncated; files are
@@ -149,8 +152,18 @@ class UsageTracker:
             return
         import traceback
         try:
-            ts = datetime.now(timezone.utc).isoformat()
+            end_ts = datetime.now(timezone.utc)
+            ts = end_ts.isoformat()
             ts_safe = ts.replace(":", "-").replace(".", "-")
+            started_at_iso = ""
+            latency_ms: int | None = None
+            if start_ts is not None:
+                if start_ts.tzinfo is None:
+                    start_ts = start_ts.replace(tzinfo=timezone.utc)
+                started_at_iso = start_ts.isoformat()
+                delta = (end_ts - start_ts).total_seconds() * 1000
+                if delta >= 0:
+                    latency_ms = int(round(delta))
             short = (request_id or f"attempt-{attempt}").replace("/", "_")[:16]
             lvl = (self.current_level or "unknown").replace("/", "_")
             purpose_seg = f"_{self.current_purpose.replace('/', '_')}" if self.current_purpose else ""
@@ -167,6 +180,8 @@ class UsageTracker:
                     exc_info[attr] = repr(val)[:1000]
             payload = {
                 "timestamp": ts,
+                "started_at": started_at_iso,
+                "latency_ms": latency_ms,
                 "level": self.current_level,
                 "purpose": self.current_purpose,
                 "kind": kind,
@@ -195,7 +210,19 @@ class UsageTracker:
         temperature: float | None = None, max_tokens: int | None = None,
         response_format: dict | None = None, response_type: str = "",
         requested_schema: dict | None = None,
+        start_ts: datetime | None = None,
     ) -> None:
+        end_ts = datetime.now(timezone.utc)
+        started_at = start_ts.isoformat() if start_ts is not None else ""
+        latency_ms: int | None = None
+        if start_ts is not None:
+            # Tolerate naive datetimes by assuming UTC — caller bugs
+            # shouldn't poison the whole record.
+            if start_ts.tzinfo is None:
+                start_ts = start_ts.replace(tzinfo=timezone.utc)
+            delta = (end_ts - start_ts).total_seconds() * 1000
+            if delta >= 0:
+                latency_ms = int(round(delta))
         rec = CallRecord(
             request_id=request_id,
             model=model,
@@ -204,7 +231,9 @@ class UsageTracker:
             total_tokens=getattr(usage, "total_tokens", 0) or 0,
             level=self.current_level,
             purpose=self.current_purpose,
-            timestamp=datetime.now(timezone.utc).isoformat(),
+            timestamp=end_ts.isoformat(),
+            started_at=started_at,
+            latency_ms=latency_ms,
             system_prompt=system_prompt,
             user_prompt=user_prompt,
             response_content=response_content,
@@ -226,6 +255,8 @@ class UsageTracker:
                 fname = f"{ts}_{lvl}{purpose_seg}_{short}.json"
                 payload = {
                     "timestamp": rec.timestamp,
+                    "started_at": rec.started_at,
+                    "latency_ms": rec.latency_ms,
                     "level": rec.level,
                     "purpose": rec.purpose,
                     "model": rec.model,
